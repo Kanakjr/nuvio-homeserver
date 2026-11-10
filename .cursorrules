@@ -1,0 +1,4 @@
+# Cursor Rules - Nuvio Web (HomeServer Edition)
+- Always maintain zero-leakage security: never commit real API keys, tokens, emails, or personal hostnames.
+- Keep local atomic git commits for each feature or fix.
+- Test changes with `npm run check`.
