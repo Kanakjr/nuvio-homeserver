@@ -89,7 +89,8 @@ export function FloatingPreCacheStatus({
               {isSuccess && (
                 <div className="floating-precache-status-text success">
                   <span>
-                    Queued {job.queuedCount} item{job.queuedCount === 1 ? "" : "s"} to HomeServer SSD
+                    {job.summary ||
+                      `Queued ${job.queuedCount} item${job.queuedCount === 1 ? "" : "s"} to HomeServer SSD`}
                   </span>
                 </div>
               )}

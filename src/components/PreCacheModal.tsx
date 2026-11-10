@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import { Check, X, HardDrive, Zap } from "lucide-react";
 import type { InstalledAddon, Meta, Video } from "../types";
 import { type TargetQuality } from "../lib/batchPreCache";
@@ -26,6 +26,34 @@ export function PreCacheModal({
   const [quality, setQuality] = useState<TargetQuality>("1080P");
   const [scope, setScope] = useState<"season" | "all">(initialScope);
   const [season, setSeason] = useState<number>(initialSeason ?? 1);
+  const [cachedIds, setCachedIds] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (initialSeason != null) setSeason(initialSeason);
+  }, [initialSeason]);
+
+  useEffect(() => {
+    if (initialScope) setScope(initialScope);
+  }, [initialScope]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    fetch("/api/cache/list")
+      .then((res) => res.json())
+      .then((data) => {
+        if (data?.items && Array.isArray(data.items)) {
+          const ids = new Set<string>();
+          for (const itm of data.items) {
+            if (itm.status === "completed") {
+              if (itm.videoId) ids.add(String(itm.videoId));
+              if (itm.contentId) ids.add(String(itm.contentId));
+            }
+          }
+          setCachedIds(ids);
+        }
+      })
+      .catch(() => {});
+  }, [isOpen]);
 
   const seasons = useMemo(() => {
     if (meta.type !== "series" || !meta.videos) return [];
@@ -39,6 +67,11 @@ export function PreCacheModal({
     }
     return meta.videos.filter((v) => (v.season ?? 0) === season);
   }, [meta, scope, season]);
+
+  const cachedEpisodesCount = useMemo(() => {
+    if (meta.type !== "series") return cachedIds.has(meta.id) ? 1 : 0;
+    return targetEpisodes.filter((ep) => cachedIds.has(ep.id)).length;
+  }, [meta, cachedIds, targetEpisodes]);
 
   if (!isOpen) return null;
 
@@ -130,6 +163,17 @@ export function PreCacheModal({
             </div>
           )}
 
+          {cachedEpisodesCount > 0 && (
+            <div className="precache-cached-pill">
+              <Check size={15} />
+              <span>
+                {cachedEpisodesCount === targetEpisodes.length
+                  ? `All ${targetEpisodes.length} episodes are already cached on SSD.`
+                  : `${cachedEpisodesCount} of ${targetEpisodes.length} episodes already cached on SSD (will skip).`}
+              </span>
+            </div>
+          )}
+
           <div className="precache-section">
             <label className="section-label">Preferred Quality</label>
             <div className="precache-quality-grid">
@@ -171,13 +215,15 @@ export function PreCacheModal({
             <button type="button" className="primary" onClick={handleStart}>
               <Zap size={16} />
               <span>
-                Pre-cache in Background (
-                {meta.type === "movie"
-                  ? "Movie"
-                  : scope === "season"
-                  ? `Season ${season}`
-                  : "All"}
-                )
+                {cachedEpisodesCount === targetEpisodes.length && targetEpisodes.length > 0
+                  ? "All Cached (Re-verify)"
+                  : `Pre-cache in Background (${
+                      meta.type === "movie"
+                        ? "Movie"
+                        : scope === "season"
+                        ? `Season ${season}`
+                        : "All"
+                    })`}
               </span>
             </button>
           </div>

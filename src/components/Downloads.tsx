@@ -163,9 +163,15 @@ export function Downloads({
           <h1>Downloads</h1>
           <span>{snapshot?.root || "Loading download storage…"}</span>
         </div>
-        <button type="button" onClick={() => void downloads.openFolder()}>
-          Open folder
-        </button>
+        <div className="downloads-head-actions">
+          <button type="button" onClick={refresh} title="Refresh downloads status">
+            <RefreshCw size={14} />
+            <span>Refresh</span>
+          </button>
+          <button type="button" onClick={() => void downloads.openFolder()}>
+            Open folder
+          </button>
+        </div>
       </header>
       <div className="downloads-tabs">
         {(["all", "active", "completed"] as const).map((key) => (
@@ -188,7 +194,20 @@ export function Downloads({
         <div className="downloads-empty">
           <Download aria-hidden="true" />
           <strong>No {filter === "all" ? "downloads" : filter} yet</strong>
-          <span>Save a source from its details page to watch it offline.</span>
+          <span>
+            {snapshot.items.length > 0 && filter !== "all" ? (
+              <button
+                type="button"
+                className="secondary"
+                style={{ marginTop: 10 }}
+                onClick={() => setFilter("all")}
+              >
+                View all {snapshot.items.length} downloaded item{snapshot.items.length === 1 ? "" : "s"}
+              </button>
+            ) : (
+              "Save a movie or series from its details page to pre-cache to HomeServer SSD."
+            )}
+          </span>
         </div>
       ) : (
         <div className="download-list">

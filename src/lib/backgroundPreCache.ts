@@ -13,7 +13,10 @@ export type PreCacheJob = {
   currentTitle: string;
   status: "running" | "completed" | "error";
   error?: string;
+  summary?: string;
   queuedCount: number;
+  skippedCount: number;
+  noStreamsCount: number;
   failedCount: number;
   startedAt: number;
   completedAt?: number;
@@ -79,6 +82,8 @@ class BackgroundPreCacheService {
       currentTitle: targetEpisodes ? (targetEpisodes[0]?.title || `Episode 1`) : meta.name,
       status: "running",
       queuedCount: 0,
+      skippedCount: 0,
+      noStreamsCount: 0,
       failedCount: 0,
       startedAt: Date.now(),
     };
@@ -89,8 +94,32 @@ class BackgroundPreCacheService {
     // Run asynchronously without blocking the UI
     (async () => {
       try {
+        // Query currently cached/downloaded items from HomeServer to avoid re-downloading
+        const existingCompleted = new Set<string>();
+        try {
+          const res = await fetch("/api/cache/list");
+          if (res.ok) {
+            const data = await res.json();
+            for (const item of data.items || []) {
+              if (item.status === "completed") {
+                if (item.videoId) existingCompleted.add(String(item.videoId));
+                if (item.contentId) existingCompleted.add(String(item.contentId));
+              }
+            }
+          }
+        } catch (_) {}
+
         if (!targetEpisodes) {
           // Single movie
+          if (existingCompleted.has(meta.id)) {
+            job.current = 1;
+            job.skippedCount = 1;
+            job.status = "completed";
+            job.summary = "Movie is already cached on HomeServer SSD.";
+            job.completedAt = Date.now();
+            return;
+          }
+
           job.currentTitle = meta.name;
           this.notify();
           const streams = await loadStreams(meta.type, meta.id, addons).catch(() => []);
@@ -101,6 +130,7 @@ class BackgroundPreCacheService {
               job.queuedCount = 1;
               job.current = 1;
               job.status = "completed";
+              job.summary = "Queued movie to HomeServer SSD";
               job.completedAt = Date.now();
             } else {
               job.status = "error";
@@ -116,6 +146,15 @@ class BackgroundPreCacheService {
             const ep = targetEpisodes[i];
             job.current = i + 1;
             job.currentTitle = ep.title || `S${ep.season ?? 1}E${ep.episode ?? i + 1}`;
+
+            // Skip episodes already completed on disk
+            if (existingCompleted.has(ep.id)) {
+              job.skippedCount++;
+              job.currentTitle = `${ep.title || `Episode ${ep.episode ?? i + 1}`} (already cached)`;
+              this.notify();
+              continue;
+            }
+
             this.notify();
 
             try {
@@ -131,7 +170,7 @@ class BackgroundPreCacheService {
                 if (ok) job.queuedCount++;
                 else job.failedCount++;
               } else {
-                job.failedCount++;
+                job.noStreamsCount++;
               }
             } catch {
               job.failedCount++;
@@ -139,8 +178,25 @@ class BackgroundPreCacheService {
             this.notify();
           }
 
-          job.status = job.queuedCount > 0 ? "completed" : "error";
-          if (job.queuedCount === 0) {
+          // Build clear, informative status
+          if (job.queuedCount > 0) {
+            job.status = "completed";
+            const parts = [`Queued ${job.queuedCount} episode${job.queuedCount === 1 ? "" : "s"}`];
+            if (job.skippedCount > 0) parts.push(`${job.skippedCount} already cached`);
+            if (job.noStreamsCount > 0) parts.push(`${job.noStreamsCount} unreleased / no torrents`);
+            job.summary = parts.join(" · ");
+          } else if (job.skippedCount > 0) {
+            job.status = "completed";
+            job.summary = `All available episodes already cached on SSD${
+              job.noStreamsCount > 0 ? ` (${job.noStreamsCount} unreleased / no torrents yet)` : ""
+            }`;
+          } else if (job.noStreamsCount > 0) {
+            job.status = "error";
+            job.error = `${job.noStreamsCount} episode${
+              job.noStreamsCount === 1 ? "" : "s"
+            } have no torrent streams available yet (not aired).`;
+          } else {
+            job.status = "error";
             job.error = "No suitable torrents found for episodes.";
           }
           job.completedAt = Date.now();

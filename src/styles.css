@@ -9491,6 +9491,16 @@ body.is-locked {
   font-size: 13px;
   word-break: break-all;
 }
+.downloads-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.downloads-head-actions button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
 .downloads-head button {
   flex: none;
   padding: 9px 16px;
@@ -10516,6 +10526,18 @@ body.is-locked {
   display: flex;
   flex-direction: column;
   gap: 20px;
+}
+.precache-cached-pill {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  background: rgba(34, 197, 94, 0.12);
+  border: 1px solid rgba(34, 197, 94, 0.35);
+  border-radius: 12px;
+  color: #4ade80;
+  font-size: 13px;
+  font-weight: 500;
 }
 .precache-section {
   display: flex;

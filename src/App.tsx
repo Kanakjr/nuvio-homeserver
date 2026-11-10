@@ -2582,10 +2582,12 @@ export function App() {
             onPlay={(stream, meta, video) => setPlayback({ stream, meta, video })}
           />
         ) : deferredActive === "downloads" && platform.downloads ? (
-          <Downloads
-            downloads={platform.downloads}
-            onPlay={(stream, meta, video) => setPlayback({ stream, meta, video })}
-          />
+          <section className="grid-page">
+            <Downloads
+              downloads={platform.downloads}
+              onPlay={(stream, meta, video) => setPlayback({ stream, meta, video })}
+            />
+          </section>
         ) : deferredActive === "calendar" ? (
           <CalendarView
             items={library}

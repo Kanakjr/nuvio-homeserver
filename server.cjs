@@ -88,7 +88,8 @@ function startBackgroundCache(infoHash, fileIdx) {
 
   const targetUrl = `${STREMIO_INTERNAL_URL}/${hash}/${idx}`;
   const req = http.get(targetUrl, (streamRes) => {
-    streamRes.on("data", () => {});
+    // Flow stream data without buffering in memory to avoid event loop saturation
+    streamRes.resume();
     streamRes.on("end", () => {
       activeCacheTasks.delete(key);
       getFileStats(hash, idx).then((stats) => {
@@ -104,7 +105,7 @@ function startBackgroundCache(infoHash, fileIdx) {
       });
     });
     streamRes.on("error", (err) => {
-      console.error(`[cache-task] Stream error for ${key}:`, err);
+      console.error(`[cache-task] Stream error for ${key}:`, err.message);
       activeCacheTasks.delete(key);
     });
   });
@@ -310,11 +311,28 @@ const server = http.createServer(async (req, res) => {
   // 4. Pre-download / Cache to HomeServer endpoints
   if (pathname === "/api/cache/list" && req.method === "GET") {
     const store = loadDownloads();
+    let handled = false;
+
+    // Fast-fallback timer if stremio-streaming-server is busy or unresponsive
+    const fallbackTimer = setTimeout(() => {
+      if (!handled) {
+        handled = true;
+        return sendJson(res, 200, {
+          ok: true,
+          root: "HomeServer SSD (/root/.stremio-server/stremio-cache)",
+          items: store.items,
+        });
+      }
+    }, 2500);
+
     // Query stremio-streaming-server global swarm stats
-    http.get(`${STREMIO_INTERNAL_URL}/stats.json`, (statsRes) => {
+    const statsReq = http.get(`${STREMIO_INTERNAL_URL}/stats.json`, (statsRes) => {
       let data = "";
       statsRes.on("data", (c) => (data += c));
       statsRes.on("end", async () => {
+        if (handled) return;
+        handled = true;
+        clearTimeout(fallbackTimer);
         let swarms = {};
         try {
           swarms = JSON.parse(data) || {};
@@ -410,13 +428,21 @@ const server = http.createServer(async (req, res) => {
           items,
         });
       });
-    }).on("error", () => {
-      // Return stored items without live swarm enrichments if server unreachable
+    });
+
+    statsReq.on("error", () => {
+      if (handled) return;
+      handled = true;
+      clearTimeout(fallbackTimer);
       return sendJson(res, 200, {
         ok: true,
         root: "HomeServer SSD (/root/.stremio-server/stremio-cache)",
         items: store.items,
       });
+    });
+
+    statsReq.setTimeout(2500, () => {
+      statsReq.destroy();
     });
     return;
   }
@@ -448,7 +474,9 @@ const server = http.createServer(async (req, res) => {
           }
 
           const id = `${hash}:${fileIdx}`;
-          const existingIdx = store.items.findIndex((x) => x.id === id);
+          const existingIdx = store.items.findIndex(
+            (x) => x.id === id || (reqItem.videoId && x.videoId === reqItem.videoId)
+          );
 
           const itemObj = {
             id,
@@ -475,7 +503,13 @@ const server = http.createServer(async (req, res) => {
           };
 
           if (existingIdx >= 0) {
-            store.items[existingIdx] = { ...store.items[existingIdx], ...itemObj, status: "downloading" };
+            const existing = store.items[existingIdx];
+            // Never corrupt or reset completed downloads on disk!
+            if (existing.status === "completed") {
+              console.log(`[cache] ${existing.title} (${id}) is already completed on disk. Skipping re-download.`);
+              continue;
+            }
+            store.items[existingIdx] = { ...existing, ...itemObj, status: "downloading" };
           } else {
             store.items.unshift(itemObj);
           }
