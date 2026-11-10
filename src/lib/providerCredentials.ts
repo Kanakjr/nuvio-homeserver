@@ -31,7 +31,11 @@ export function providerCredential(
   const value = rows.find(
     (row) => row.provider.toLowerCase() === provider.toLowerCase(),
   )?.credentialJson[field];
-  return typeof value === "string" ? value.trim() : "";
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (provider.toLowerCase() === "tmdb" && field === "api_key") {
+    return import.meta.env.VITE_TMDB_API_KEY?.trim() || "";
+  }
+  return "";
 }
 
 /** Updates one field without losing any other provider or credential field. */

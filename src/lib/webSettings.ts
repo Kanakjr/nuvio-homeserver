@@ -558,7 +558,7 @@ export function readWebSettings(blob: SettingsBlob | null): WebSettings {
         "tmdb_settings",
         "tmdb_enabled",
         "boolean",
-        false,
+        Boolean(import.meta.env?.VITE_TMDB_API_KEY) || false,
       ),
       tmdbLanguage: blobTypedValue(
         blob,

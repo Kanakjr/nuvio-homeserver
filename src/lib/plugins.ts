@@ -1,4 +1,5 @@
 import { platform } from "../platform/index.ts";
+import { resolveTorrentStreamUrl } from "./torrentStream.ts";
 import { normalizePluginManifestUrl } from "./pluginUrl";
 import { safeHttpUrl } from "./security";
 import type {
@@ -547,7 +548,9 @@ function runtimeResultsToStreams(
   return results.flatMap((item): Stream[] => {
     const rawUrl = typeof item.url === "string" ? item.url : item.url?.url;
     const url = safeHttpUrl(rawUrl);
-    if (!url) return [];
+    const torrentRes = !url && item.infoHash ? resolveTorrentStreamUrl(item.infoHash) : null;
+    const finalUrl = url ?? torrentRes?.url;
+    if (!finalUrl) return [];
     const headers = Object.fromEntries(
       Object.entries(item.headers ?? {}).filter(
         ([key, value]) =>
@@ -561,7 +564,8 @@ function runtimeResultsToStreams(
       name: item.name || item.title || scraper.name,
       title: item.title || item.name || "",
       description: [item.quality, item.size, item.language].filter(Boolean).join(" • "),
-      url,
+      url: finalUrl,
+      externalUrl: torrentRes?.externalUrl,
       infoHash: item.infoHash,
       addonName: groupName,
       addonLogo: scraper.logo,

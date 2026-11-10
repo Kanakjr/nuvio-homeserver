@@ -1,4 +1,5 @@
 import { resolveTmdbSource } from "./tmdbCollections";
+import { resolveTorrentStreamUrl } from "./torrentStream.ts";
 import {
   createHostCooldown,
   createHostLimiter,
@@ -1016,30 +1017,40 @@ export async function loadStreams(
         const payload = await fetchJson<{
           streams?: Array<Record<string, unknown>>;
         }>(resourceUrl(addon.url, "stream", type, id), 20_000, signal);
-        const mapped = (payload.streams ?? []).map((stream): Stream => ({
-          name: String(stream.name ?? addon.manifest!.name),
-          title: String(stream.title ?? ""),
-          description: String(stream.description ?? ""),
-          url: stream.url ? String(stream.url) : undefined,
-          externalUrl: stream.externalUrl
-            ? String(stream.externalUrl)
-            : undefined,
-          infoHash: stream.infoHash ? String(stream.infoHash) : undefined,
-          fileIdx: stream.fileIdx == null ? undefined : Number(stream.fileIdx),
-          addonName: addon.manifest!.name,
-          addonLogo: addon.manifest!.logo,
-          behaviorHints:
+        const mapped = (payload.streams ?? []).map((stream): Stream => {
+          const infoHash = stream.infoHash ? String(stream.infoHash) : undefined;
+          const fileIdx = stream.fileIdx == null ? 0 : Number(stream.fileIdx);
+          const behaviorHints =
             typeof stream.behaviorHints === "object"
               ? (stream.behaviorHints as Stream["behaviorHints"])
-              : undefined,
-          // Passed through rather than parsed. Only a shell that can reach a
-          // Debrid service does anything with it, and the filters read fields
-          // this client has no other reason to know about.
-          clientResolve:
-            typeof stream.clientResolve === "object" && stream.clientResolve
-              ? (stream.clientResolve as Stream["clientResolve"])
-              : undefined,
-        }));
+              : undefined;
+          const torrentRes = (!stream.url && infoHash)
+            ? resolveTorrentStreamUrl(
+                infoHash,
+                fileIdx,
+                behaviorHints?.filename,
+                stream.sources as unknown[],
+              )
+            : null;
+          return {
+            name: String(stream.name ?? addon.manifest!.name),
+            title: String(stream.title ?? ""),
+            description: String(stream.description ?? ""),
+            url: stream.url ? String(stream.url) : (torrentRes?.url ?? undefined),
+            externalUrl: stream.externalUrl
+              ? String(stream.externalUrl)
+              : (torrentRes?.externalUrl ?? undefined),
+            infoHash,
+            fileIdx: stream.fileIdx == null ? undefined : Number(stream.fileIdx),
+            addonName: addon.manifest!.name,
+            addonLogo: addon.manifest!.logo,
+            behaviorHints,
+            clientResolve:
+              typeof stream.clientResolve === "object" && stream.clientResolve
+                ? (stream.clientResolve as Stream["clientResolve"])
+                : undefined,
+          };
+        });
         batches[index] = mapped;
         if (!signal?.aborted) onAddon?.(addon.manifest!.name, mapped, batches.flat());
         return mapped;
