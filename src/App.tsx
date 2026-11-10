@@ -62,6 +62,7 @@ import { AccentPicker } from "./components/AccentPicker";
 import { DetailsDebugToggle } from "./components/DetailsDebug";
 import { applyResolvedTheme } from "./lib/themeCache";
 import { PersonPage } from "./components/Person";
+import { FloatingPreCacheStatus } from "./components/FloatingPreCacheStatus";
 import { ProfileSwitcher } from "./components/ProfileSwitcher";
 import {
   loadAddons,
@@ -468,6 +469,32 @@ export function App() {
   const [bootHandoff] = useState(() => readExternalHandoff());
   const [bootReport] = useState(() => takeExternalReport());
   const resumeConsumed = useRef(false);
+
+  // HomeServer Downloads live polling for badge & manager counts
+  const [downloadsSnapshot, setDownloadsSnapshot] = useState<Awaited<ReturnType<NonNullable<typeof platform.downloads>["list"]>> | null>(null);
+  useEffect(() => {
+    if (!platform.downloads) return;
+    let mounted = true;
+    const fetchDownloads = () => {
+      platform.downloads?.list().then((snap) => {
+        if (mounted) setDownloadsSnapshot(snap);
+      }).catch(() => {});
+    };
+    fetchDownloads();
+    const interval = setInterval(fetchDownloads, 3500);
+    return () => {
+      mounted = false;
+      clearInterval(interval);
+    };
+  }, []);
+
+  const activeDownloadsCount = useMemo(() => {
+    return downloadsSnapshot?.items.filter(
+      (item) => item.status === "downloading" || item.status === "queued",
+    ).length || 0;
+  }, [downloadsSnapshot]);
+
+  const totalDownloadsCount = downloadsSnapshot?.items.length || 0;
   /**
    * What was last handed to another player, for as long as we are still owed
    * an answer about it. A report can arrive well after boot — bringing an
@@ -2380,7 +2407,12 @@ export function App() {
               setFolder(null);
             }}
           >
-            <item.icon />
+            <span className="nav-icon-container">
+              <item.icon />
+              {item.key === "downloads" && activeDownloadsCount > 0 && (
+                <span className="nav-badge-pill">{activeDownloadsCount}</span>
+              )}
+            </span>
           </button>
         ))}
       </aside>
@@ -2544,8 +2576,10 @@ export function App() {
             items={library}
             index={watchIndex}
             addons={addons}
+            downloadsCount={totalDownloadsCount}
             onOpen={openDetails}
             onMenu={(item, x, y) => setTitleMenu({ item, x, y })}
+            onPlay={(stream, meta, video) => setPlayback({ stream, meta, video })}
           />
         ) : deferredActive === "downloads" && platform.downloads ? (
           <Downloads
@@ -2651,7 +2685,12 @@ export function App() {
               setFolder(null);
             }}
           >
-            <item.icon />
+            <span className="nav-icon-container">
+              <item.icon />
+              {item.key === "downloads" && activeDownloadsCount > 0 && (
+                <span className="nav-badge-pill">{activeDownloadsCount}</span>
+              )}
+            </span>
             <span>{t(item.label)}</span>
           </button>
         ))}
@@ -2878,6 +2917,11 @@ export function App() {
             setSelected(null);
             setDetailLaunch(null);
           }}
+          onGoToDownloads={() => {
+            setSelected(null);
+            setDetailLaunch(null);
+            setActive("downloads");
+          }}
           onLibrary={toggleLibrary}
           defaultSourceAddon={defaultSourceAddon}
           defaultPlayer={externalPlayer}
@@ -2932,6 +2976,13 @@ export function App() {
             }}
           />
       )}
+      <FloatingPreCacheStatus
+        onGoToDownloads={() => {
+          setSelected(null);
+          setDetailLaunch(null);
+          setActive("downloads");
+        }}
+      />
       </div>
     </>
   );
@@ -3024,16 +3075,20 @@ function LibraryView({
   items,
   index,
   addons,
+  downloadsCount = 0,
   onOpen,
   onMenu,
+  onPlay,
 }: {
   items: LibraryItem[];
   index: WatchIndex;
   addons: InstalledAddon[];
+  downloadsCount?: number;
   onOpen(item: Meta): void;
   onMenu(item: Meta, x: number, y: number): void;
+  onPlay?(stream: Stream, meta: Meta, video?: Video): void;
 }) {
-  const [tab, setTab] = useState<"all" | "movie" | "series">("all");
+  const [tab, setTab] = useState<"all" | "movie" | "series" | "downloads">("all");
   // Opening the picker and rolling are separate now: the modal appears first
   // so the scope can be chosen, and rolls happen inside it.
   const [randomOpen, setRandomOpen] = useState(false);
@@ -3051,14 +3106,17 @@ function LibraryView({
     [items, tab],
   );
   const tally = useMemo(() => tallyWatched(items, index.watched), [items, index]);
-  const shown = tally[tab];
-  const watchedShare = shown.total ? shown.watched / shown.total : 0;
+  const shown = tab !== "downloads" ? tally[tab] : null;
+  const watchedShare = shown && shown.total ? shown.watched / shown.total : 0;
   const { visible } = useProgressiveList(filtered, { resetKey: tab });
   const tabs = [
-    { key: "all", label: t("library.all"), count: counts.all },
-    { key: "movie", label: t("library.movies"), count: counts.movie },
-    { key: "series", label: t("library.series"), count: counts.series },
-  ] as const;
+    { key: "all" as const, label: t("library.all"), count: counts.all },
+    { key: "movie" as const, label: t("library.movies"), count: counts.movie },
+    { key: "series" as const, label: t("library.series"), count: counts.series },
+    ...(platform.downloads
+      ? [{ key: "downloads" as const, label: "Downloads", count: downloadsCount }]
+      : []),
+  ];
 
 
   return (
@@ -3090,58 +3148,69 @@ function LibraryView({
           {t("library.randomPick")}
         </button>
       </div>
-      {shown.total > 0 && (
-        <div className="library-watched">
-          <div
-            className="library-watched-bar"
-            role="progressbar"
-            aria-valuemin={0}
-            aria-valuemax={shown.total}
-            aria-valuenow={shown.watched}
-            aria-label={t("library.watchedOf", shown)}
-          >
-            <i style={{ width: `${watchedShare * 100}%` }} />
-          </div>
-          <span className="library-watched-text">
-            <strong>{t("library.watchedOf", shown)}</strong>
-            {/* On All, the split by type, so one number does not hide the other. */}
-            {tab === "all" && tally.movie.total > 0 && tally.series.total > 0 && (
-              <>
-                <em>{t("library.movies")} {tally.movie.watched}/{tally.movie.total}</em>
-                <em>{t("library.series")} {tally.series.watched}/{tally.series.total}</em>
-              </>
-            )}
-          </span>
-        </div>
-      )}
-      {filtered.length === 0 ? (
-        <div className="empty-state">
-          <strong>{t("library.empty.title")}</strong>
-          <span>
-            {tab === "all"
-              ? t("library.empty.body")
-              : `No ${tab === "movie" ? "movies" : "series"} in your library.`}
-          </span>
+      {tab === "downloads" && platform.downloads ? (
+        <div className="library-downloads-panel">
+          <Downloads
+            downloads={platform.downloads}
+            onPlay={(stream, meta, video) => onPlay?.(stream, meta, video)}
+          />
         </div>
       ) : (
-        <div className="poster-grid">
-          {visible.map((item) => (
-            <PosterCard
-              key={`${item.type}:${item.id}`}
-              item={item}
-              index={index}
-              onOpen={onOpen}
-              onMenu={onMenu}
-            />
-          ))}
-        </div>
+        <>
+          {shown && shown.total > 0 && (
+            <div className="library-watched">
+              <div
+                className="library-watched-bar"
+                role="progressbar"
+                aria-valuemin={0}
+                aria-valuemax={shown.total}
+                aria-valuenow={shown.watched}
+                aria-label={t("library.watchedOf", shown)}
+              >
+                <i style={{ width: `${watchedShare * 100}%` }} />
+              </div>
+              <span className="library-watched-text">
+                <strong>{t("library.watchedOf", shown)}</strong>
+                {/* On All, the split by type, so one number does not hide the other. */}
+                {tab === "all" && tally.movie.total > 0 && tally.series.total > 0 && (
+                  <>
+                    <em>{t("library.movies")} {tally.movie.watched}/{tally.movie.total}</em>
+                    <em>{t("library.series")} {tally.series.watched}/{tally.series.total}</em>
+                  </>
+                )}
+              </span>
+            </div>
+          )}
+          {filtered.length === 0 ? (
+            <div className="empty-state">
+              <strong>{t("library.empty.title")}</strong>
+              <span>
+                {tab === "all"
+                  ? t("library.empty.body")
+                  : `No ${tab === "movie" ? "movies" : "series"} in your library.`}
+              </span>
+            </div>
+          ) : (
+            <div className="poster-grid">
+              {visible.map((item) => (
+                <PosterCard
+                  key={`${item.type}:${item.id}`}
+                  item={item}
+                  index={index}
+                  onOpen={onOpen}
+                  onMenu={onMenu}
+                />
+              ))}
+            </div>
+          )}
+        </>
       )}
       {randomOpen && (
         <TitleRoulette
           items={items}
           index={index}
           addons={addons}
-          initialScope={tab}
+          initialScope={tab === "downloads" ? "all" : tab}
           onClose={() => setRandomOpen(false)}
           onOpen={(item) => {
             setRandomOpen(false);
@@ -3873,6 +3942,61 @@ function AddonsPage({
   );
 }
 
+const FEATURED_COMMUNITY_ADDONS = [
+  {
+    name: "PenguPlay",
+    description: "Multi-source movies, series, anime, live TV & multi-lingual audio streams",
+    url: "https://pengu.uk/%7B%22auth_token%22%3A%22sDi9sGG05EvSXQuf5rp0e6rdGao3wvllFzdY0tRD1so%22%7D/manifest.json",
+    configUrl: "https://pengu.uk/",
+    category: "Streams",
+  },
+  {
+    name: "BetterPosters",
+    description: "High-resolution curated posters and visual artwork metadata",
+    url: "https://btttr.cc/manifest.json",
+    category: "Catalogs",
+  },
+  {
+    name: "Streaming Catalogs",
+    description: "Trending shelves for Netflix, HBO Max, Disney+, Apple TV+, Prime Video",
+    url: "https://7a82163c306e-stremio-netflix-catalog-addon.baby-beamup.club/manifest.json",
+    category: "Catalogs",
+  },
+  {
+    name: "Torrentio",
+    description: "Multi-source torrent scraper with Real-Debrid, TorBox, and P2P streaming",
+    url: "https://torrentio.strem.fun/manifest.json",
+    configUrl: "https://torrentio.strem.fun/configure",
+    category: "Streams",
+  },
+  {
+    name: "Comet",
+    description: "Lightweight, ultra-fast ELF-hosted torrent scraper backup",
+    url: "https://comet.elfhosted.com/manifest.json",
+    configUrl: "https://comet.elfhosted.com/configure",
+    category: "Streams",
+  },
+  {
+    name: "MediaFusion",
+    description: "Extensive regional cinema (Hindi, Tamil, Telugu, Anime) & live sports",
+    url: "https://mediafusion.elfhosted.com/manifest.json",
+    configUrl: "https://mediafusion.elfhosted.com/configure",
+    category: "Streams",
+  },
+  {
+    name: "OpenSubtitles v3",
+    description: "Official multi-language subtitle provider with automatic synchronization",
+    url: "https://opensubtitles-v3.strem.io/manifest.json",
+    category: "Subtitles",
+  },
+  {
+    name: "Anime Kitsu",
+    description: "Complete seasonal anime catalogs, episode guides, and tracking",
+    url: "https://anime-kitsu.strem.fun/manifest.json",
+    category: "Anime",
+  },
+];
+
 function AddonSettings({
   addons,
   rows,
@@ -3884,6 +4008,22 @@ function AddonSettings({
 }: Omit<Parameters<typeof AddonsPage>[0], "onBack">) {
   const [url, setUrl] = useState("");
   const [error, setError] = useState("");
+  const [installing, setInstalling] = useState<string | null>(null);
+
+  async function handleQuickInstall(targetUrl: string) {
+    setInstalling(targetUrl);
+    setError("");
+    try {
+      await onAdd(targetUrl);
+    } catch (reason) {
+      setError(
+        reason instanceof Error ? reason.message : "Could not install addon",
+      );
+    } finally {
+      setInstalling(null);
+    }
+  }
+
   return (
     <>
       <form
@@ -3912,6 +4052,128 @@ function AddonSettings({
         <button className="primary">Install</button>
       </form>
       {error && <div className="notice error">{error}</div>}
+
+      <div style={{ marginTop: "1.25rem", marginBottom: "1.75rem" }}>
+        <h3
+          style={{
+            fontSize: "0.85rem",
+            textTransform: "uppercase",
+            letterSpacing: "0.06em",
+            color: "rgba(255, 255, 255, 0.45)",
+            marginBottom: "0.75rem",
+          }}
+        >
+          Community Recommended Addons (NuvioHub)
+        </h3>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))",
+            gap: "0.75rem",
+          }}
+        >
+          {FEATURED_COMMUNITY_ADDONS.map((item) => {
+            const isInstalled = rows.some((r) => r.url === item.url);
+            const isBusy = installing === item.url;
+            return (
+              <div
+                key={item.url}
+                style={{
+                  background: "rgba(255, 255, 255, 0.04)",
+                  border: "1px solid rgba(255, 255, 255, 0.08)",
+                  borderRadius: "10px",
+                  padding: "0.85rem 1rem",
+                  display: "flex",
+                  flexDirection: "column",
+                  justifyContent: "space-between",
+                  gap: "0.5rem",
+                }}
+              >
+                <div>
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                    }}
+                  >
+                    <strong style={{ fontSize: "0.95rem" }}>{item.name}</strong>
+                    <span
+                      style={{
+                        fontSize: "0.7rem",
+                        padding: "2px 6px",
+                        borderRadius: "4px",
+                        background: "rgba(255, 255, 255, 0.1)",
+                        color: "rgba(255, 255, 255, 0.6)",
+                      }}
+                    >
+                      {item.category}
+                    </span>
+                  </div>
+                  <p
+                    style={{
+                      fontSize: "0.8rem",
+                      color: "rgba(255, 255, 255, 0.6)",
+                      margin: "0.25rem 0 0 0",
+                      lineHeight: "1.3",
+                    }}
+                  >
+                    {item.description}
+                  </p>
+                </div>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "0.6rem",
+                    marginTop: "0.25rem",
+                  }}
+                >
+                  {isInstalled ? (
+                    <span
+                      style={{
+                        fontSize: "0.8rem",
+                        color: "#10b981",
+                        fontWeight: 600,
+                      }}
+                    >
+                      ✓ Installed
+                    </span>
+                  ) : (
+                    <button
+                      type="button"
+                      className="primary"
+                      style={{
+                        padding: "0.35rem 0.75rem",
+                        fontSize: "0.8rem",
+                        borderRadius: "6px",
+                      }}
+                      disabled={isBusy}
+                      onClick={() => handleQuickInstall(item.url)}
+                    >
+                      {isBusy ? "Installing…" : "Install"}
+                    </button>
+                  )}
+                  {item.configUrl && (
+                    <a
+                      href={item.configUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      style={{
+                        fontSize: "0.75rem",
+                        color: "var(--accent, #60a5fa)",
+                        textDecoration: "none",
+                      }}
+                    >
+                      Configure (Debrid) ↗
+                    </a>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
       <div className="addon-list-heading">
         <h2>{t("settings.card.installedAddons")}</h2>
         <button className="secondary" onClick={onRefresh}>

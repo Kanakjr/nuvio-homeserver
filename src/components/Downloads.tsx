@@ -48,12 +48,16 @@ export function Downloads({
           active.add(item.id);
           const previous = samples.current.get(item.id);
           let speed = previous?.speed ?? 0;
-          if (previous && at > previous.at && item.bytesDownloaded >= previous.bytes) {
+          if (previous && at > previous.at && item.bytesDownloaded > previous.bytes) {
             const measured =
               ((item.bytesDownloaded - previous.bytes) * 1000) / (at - previous.at);
             // Smoothed, because a raw sample swings wildly enough to be
             // unreadable — the number is for a person, not a graph.
             speed = previous.speed > 0 ? previous.speed * 0.65 + measured * 0.35 : measured;
+          } else if ((item as any).downloadSpeed && (item as any).downloadSpeed > 0) {
+            speed = (item as any).downloadSpeed;
+          } else if (previous && at - previous.at > 2500 && item.bytesDownloaded === previous.bytes) {
+            speed = 0;
           }
           samples.current.set(item.id, { bytes: item.bytesDownloaded, at, speed });
           next[item.id] = speed;
@@ -231,17 +235,27 @@ function Row({
     item.season != null && item.episode != null
       ? `S${item.season} E${item.episode}`
       : item.contentType;
+  const poster = image || (item as any).posterUrl;
+  const peers = (item as any).peers;
+  const serverSpeed = (item as any).downloadSpeed;
+  const effectiveSpeed = speed && speed > 0 ? speed : serverSpeed && serverSpeed > 0 ? serverSpeed : 0;
+  const speedText =
+    effectiveSpeed > 0
+      ? `${bytes(effectiveSpeed)}/s`
+      : peers && peers > 0
+      ? `Connecting (${peers} peers)`
+      : "Connecting to swarm…";
 
   return (
     <article className="download-row">
-      <div className="download-art">{image && <img src={image} alt="" />}</div>
+      <div className="download-art">{poster && <img src={poster} alt="" />}</div>
       <div className="download-copy">
         <small>
           {label} · {item.status}
         </small>
         <h2>{item.showName || item.title}</h2>
         {item.showName && <strong>{item.title}</strong>}
-        <span>{item.sourceName || item.filePath || "Nuvio download"}</span>
+        <span>{item.sourceName || item.filePath || "Nuvio download"}{peers ? ` · 👤 ${peers} peers` : ""}</span>
         {waiting && (
           <div className="download-progress">
             <i>
@@ -252,7 +266,7 @@ function Row({
                 ? "Queued"
                 : `${bytes(item.bytesDownloaded)}${
                     item.totalBytes ? ` of ${bytes(item.totalBytes)}` : ""
-                  } · ${speed && speed > 0 ? `${bytes(speed)}/s` : "Measuring…"}`}
+                  } · ${speedText}`}
             </span>
           </div>
         )}
@@ -265,7 +279,7 @@ function Row({
         )}
       </div>
       <div className="download-actions">
-        {item.status === "completed" && (
+        {(item.status === "completed" || item.playUrl) && (
           <button type="button" onClick={onPlay}>
             <Play aria-hidden="true" />
             Play

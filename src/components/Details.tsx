@@ -1,4 +1,5 @@
 import { selectAutoStream } from "../lib/playbackPolicy";
+import { resolveTorrentStreamUrl } from "../lib/torrentStream";
 import { Select } from "./Select";
 import { AutoPlayProgress, type AutoPlayStage } from "./AutoPlayProgress";
 import { bingeGroupFor } from "../lib/bingeCache";
@@ -43,6 +44,10 @@ import {
 } from "../lib/metadataEnrichment";
 import { platform } from "../platform/index.ts";
 import { canPlayInApp } from "../lib/externalPlayer";
+import { type QualityFilter, matchStreamQuality } from "../lib/qualityMatcher";
+import { parseStreamTarget, startPreCache } from "../lib/cacheManager";
+import { PreCacheButton } from "./PreCacheButton";
+import { PreCacheModal } from "./PreCacheModal";
 import { needsUnsendableHeaders, saveFilename } from "../lib/fileDownload";
 import {
   applyDebridStreamSettings,
@@ -392,6 +397,7 @@ export function Details({
   defaultPlayer,
   onDefaultPlayer,
   onPerson,
+  onGoToDownloads,
 }: {
   seed: Meta;
   addons: InstalledAddon[];
@@ -404,6 +410,7 @@ export function Details({
   debridRules: DebridRules;
   metaScreenSettings: MetaScreenSettings;
   onClose(): void;
+  onGoToDownloads?(): void;
   onLibrary(meta: Meta): void;
   /**
    * `player` overrides the configured default for this one launch, which is
@@ -447,6 +454,8 @@ export function Details({
   const [dominantColor, setDominantColor] = useState(DEFAULT_DETAIL_COLOR);
   const [selectedTrailerCategory, setSelectedTrailerCategory] = useState("");
   const [trailerOpen, setTrailerOpen] = useState(false);
+  const [preCacheModalOpen, setPreCacheModalOpen] = useState(false);
+  const [preCacheScope, setPreCacheScope] = useState<"season" | "all">("season");
   const initialSourceConsumed = useRef(false);
   const trailerGroups = useMemo(() => {
     const groups = new Map<string, Meta["trailers"]>();
@@ -573,13 +582,30 @@ export function Details({
    */
   const activeAddon =
     sourceAddon && sourceAddons.includes(sourceAddon) ? sourceAddon : "";
-  const visibleStreams = useMemo(
-    () =>
-      activeAddon
-        ? streams.filter((item) => item.addonName === activeAddon)
-        : streams,
-    [streams, activeAddon],
-  );
+  const [qualityFilter, setQualityFilter] = useState<QualityFilter>("ALL");
+
+  const qualityCounts = useMemo(() => {
+    const pool = activeAddon
+      ? streams.filter((item) => item.addonName === activeAddon)
+      : streams;
+    return {
+      ALL: pool.length,
+      "4K": pool.filter((s) => matchStreamQuality(s, "4K")).length,
+      "1080P": pool.filter((s) => matchStreamQuality(s, "1080P")).length,
+      "720P": pool.filter((s) => matchStreamQuality(s, "720P")).length,
+      HDR: pool.filter((s) => matchStreamQuality(s, "HDR")).length,
+    };
+  }, [streams, activeAddon]);
+
+  const visibleStreams = useMemo(() => {
+    let result = activeAddon
+      ? streams.filter((item) => item.addonName === activeAddon)
+      : streams;
+    if (qualityFilter !== "ALL") {
+      result = result.filter((item) => matchStreamQuality(item, qualityFilter));
+    }
+    return result;
+  }, [streams, activeAddon, qualityFilter]);
   /** Where this would resume from, which is the useful thing to say up here. */
   const sourceResume = useMemo(() => {
     const row = watchIndex.progress.get(
@@ -1027,14 +1053,24 @@ export function Details({
    * would quietly mean "forever, as long as you keep watching".
    */
   function playFresh(stream: Stream, video?: Video, player?: ExternalPlayerMode) {
-    saveStreamLink(reuseKey(video), stream);
-    // The sheet has done its job, so it goes now rather than waiting behind the
-    // player: leaving playback used to land back on the list you had just
-    // chosen from, which is a step forward dressed as a step back. Behind the
-    // player is the page you came from — this title, or the home page you
-    // continued from.
+    let playableStream = stream;
+    if (!playableStream.url && playableStream.infoHash) {
+      const res = resolveTorrentStreamUrl(
+        playableStream.infoHash,
+        playableStream.fileIdx ?? 0,
+        playableStream.behaviorHints?.filename,
+      );
+      if (res) {
+        playableStream = {
+          ...playableStream,
+          url: res.url,
+          externalUrl: playableStream.externalUrl || res.externalUrl,
+        };
+      }
+    }
+    saveStreamLink(reuseKey(video), playableStream);
     closeSource();
-    onPlay(stream, meta, video, player);
+    onPlay(playableStream, meta, video, player);
   }
 
   async function sources(video?: Video, forceManual = false) {
@@ -1297,6 +1333,18 @@ export function Details({
             >
               {inLibrary ? <Check size={26} /> : <Plus size={26} />}
             </button>
+            <button
+              type="button"
+              className="icon-pill"
+              title={meta.type === "series" ? "Pre-cache series to HomeServer SSD" : "Pre-cache movie to HomeServer SSD"}
+              aria-label="Pre-cache to HomeServer SSD"
+              onClick={() => {
+                setPreCacheScope("season");
+                setPreCacheModalOpen(true);
+              }}
+            >
+              <DownloadIcon size={24} />
+            </button>
             {meta.type !== "series" && (
               <button
                 className={`icon-pill${heroTargetWatched ? " active" : ""}`}
@@ -1420,6 +1468,20 @@ export function Details({
                 onClick={() => setEpisodeRouletteOpen(true)}
               >
                 <Dices />
+              </button>
+              <button
+                type="button"
+                className="episode-cache-button"
+                aria-label={`Pre-cache Season ${season} to HomeServer SSD`}
+                title={`Pre-cache Season ${season} to HomeServer SSD`}
+                disabled={!meta.videos.length}
+                onClick={() => {
+                  setPreCacheScope("season");
+                  setPreCacheModalOpen(true);
+                }}
+              >
+                <DownloadIcon size={15} />
+                <span>Cache Season</span>
               </button>
             </div>
           </header>
@@ -1781,6 +1843,25 @@ export function Details({
                 <RefreshCw />
               </button>
             </header>
+            {streams.length > 0 && (
+              <div className="source-quality-bar">
+                {(["ALL", "4K", "1080P", "720P", "HDR"] as const).map((q) => {
+                  const count = qualityCounts[q];
+                  if (q !== "ALL" && count === 0) return null;
+                  return (
+                    <button
+                      key={q}
+                      type="button"
+                      className={`quality-chip ${qualityFilter === q ? "active" : ""}`}
+                      onClick={() => setQualityFilter(q)}
+                    >
+                      {q === "ALL" ? "All Qualities" : q === "1080P" ? "1080p" : q === "720P" ? "720p" : q}
+                      <span className="quality-count">{count}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
             {downloadNote && <div className="sheet-note">{downloadNote}</div>}
             {autoMissed && !autoStage && (
               <div className="sheet-note">{t("autoplay.noMatch")}</div>
@@ -1812,7 +1893,7 @@ export function Details({
                   >
                     <button
                       className="source-main"
-                      disabled={!stream.url && !stream.externalUrl}
+                      disabled={!stream.url && !stream.externalUrl && !stream.infoHash}
                       onClick={() => {
                         // A hold that opened the menu must not also play.
                         if (holdFired.current) {
@@ -1863,6 +1944,7 @@ export function Details({
                               ? " · External player recommended"
                               : "";
                           })()}
+                          <PreCacheButton stream={stream} />
                         </small>
                         {streamBadgeSettings.placement === "BOTTOM" && (
                           <SourceBadges
@@ -1885,13 +1967,70 @@ export function Details({
                         icon: <Copy size={16} />,
                         onSelect: () =>
                           void navigator.clipboard.writeText(
-                            sourceMenu.stream.url!,
+                            sourceMenu.stream.url || sourceMenu.stream.externalUrl || "",
                           ),
                       },
-                      // Downloading is a shell capability. In a browser the
-                      // entry is not built rather than shown and refused —
-                      // "Copy link" is the useful thing there, and it is
-                      // already above.
+                      ...(parseStreamTarget(sourceMenu.stream)
+                        ? [
+                            {
+                              label: "⚡ Pre-cache to HomeServer",
+                              icon: <DownloadIcon size={16} />,
+                              onSelect: () => {
+                                const target = parseStreamTarget(sourceMenu.stream);
+                                if (target) {
+                                  void startPreCache(target.hash, target.fileIdx);
+                                  setDownloadNote("Caching torrent to HomeServer SSD in background…");
+                                  window.setTimeout(() => setDownloadNote(""), 4000);
+                                }
+                              },
+                            },
+                          ]
+                        : []),
+                      ...(platform.externalPlayer.options("player").some((o) => o.mode === "iina")
+                        ? [
+                            {
+                              label: "Play in IINA",
+                              icon: <Play size={16} />,
+                              onSelect: () => {
+                                const target =
+                                  sourceMenu.stream.url ||
+                                  sourceMenu.stream.externalUrl ||
+                                  "";
+                                platform.externalPlayer.launch("iina", target, meta.name);
+                              },
+                            },
+                          ]
+                        : []),
+                      ...(platform.externalPlayer.options("player").some((o) => o.mode === "vlc")
+                        ? [
+                            {
+                              label: "Play in VLC",
+                              icon: <Play size={16} />,
+                              onSelect: () => {
+                                const target =
+                                  sourceMenu.stream.url ||
+                                  sourceMenu.stream.externalUrl ||
+                                  "";
+                                platform.externalPlayer.launch("vlc", target, meta.name);
+                              },
+                            },
+                          ]
+                        : []),
+                      ...(platform.externalPlayer.options("player").some((o) => o.mode === "infuse")
+                        ? [
+                            {
+                              label: "Play in Infuse",
+                              icon: <Play size={16} />,
+                              onSelect: () => {
+                                const target =
+                                  sourceMenu.stream.url ||
+                                  sourceMenu.stream.externalUrl ||
+                                  "";
+                                platform.externalPlayer.launch("infuse", target, meta.name);
+                              },
+                            },
+                          ]
+                        : []),
                       ...(platform.downloads
                         ? [
                             {
@@ -1984,6 +2123,15 @@ export function Details({
           </section>
         </div>
       )}
+      <PreCacheModal
+        meta={meta}
+        addons={addons}
+        initialSeason={season ?? 1}
+        initialScope={preCacheScope}
+        isOpen={preCacheModalOpen}
+        onClose={() => setPreCacheModalOpen(false)}
+        onGoToDownloads={onGoToDownloads}
+      />
     </div>
   );
 }
