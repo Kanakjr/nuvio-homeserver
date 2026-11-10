@@ -1,0 +1,12 @@
+{
+  "supabaseInternalUrl": "http://host.docker.internal:8008",
+  "serviceRoleKey": "your-supabase-service-role-key-here",
+  "anonKey": "your-supabase-anon-key-here",
+  "emailMappings": {
+    "admin@example.com": {
+      "supabaseEmail": "admin@example.com",
+      "defaultProfileIndex": 1,
+      "defaultProfileName": "Admin"
+    }
+  }
+}

@@ -1,21 +1,57 @@
+# Dependencies
 node_modules/
+.pnp
+.pnp.js
+
+# Build outputs
 dist/
-.env.local
-*.log
-
-# Tunnel config: names a specific tunnel UUID and points at the credentials
-# JSON in ~/.cloudflared. Machine-specific, and not something to publish.
-cloudflared.yml
-*.cloudflared.yml
-cert.pem
-*.pem
-
-
-# Compiled artifacts of vite.config.ts. Vite loads vite.config.js in
-# preference to the .ts, so a stale copy here silently shadows the source.
+dist-ssr/
+build/
+*.tsbuildinfo
 vite.config.js
 vite.config.d.ts
-*.tsbuildinfo
 
-# Serena (local code-assistant index)
+# Local runtime data & caches
+data/
+downloads/
+*.tmp
+*.tmp.*
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+.env.production
+.env.development
+!.env.example
+
+# SSL, certificates & Cloudflare credentials
+cloudflared.yml
+*.cloudflared.yml
+*.pem
+*.key
+*.cert
+*.crt
+*.pfx
+*.p12
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE & Assistant caches
+.vscode/
+.idea/
+*.swp
+*.swo
 .serena/
+.cursor/
