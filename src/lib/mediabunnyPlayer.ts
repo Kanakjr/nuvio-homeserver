@@ -150,6 +150,7 @@ export function chooseAudioTrack(
   languages: string[],
   preferred: string[],
   decodable?: boolean[],
+  trackNames?: (string | null | undefined)[],
 ): number {
   const available = languages.map(normalizeLanguage);
   const playable = languages
@@ -157,8 +158,23 @@ export function chooseAudioTrack(
     .filter((index) => decodable?.[index] !== false);
 
   for (const want of preferred.map(normalizeLanguage).filter(Boolean)) {
+    // 1. Language code match (e.g. "en", "eng")
     const match = playable.find((index) => available[index] === want);
     if (match !== undefined) return match;
+
+    // 2. Keyword match on track label/title if language code was unspecified or undefined
+    if (trackNames) {
+      const nameMatch = playable.find((index) => {
+        const name = (trackNames[index] || "").toLowerCase();
+        if (want === "en") return /\b(eng|english)\b/i.test(name);
+        if (want === "ja") return /\b(jpn|jap|japanese)\b/i.test(name);
+        if (want === "es") return /\b(spa|spanish|esp)\b/i.test(name);
+        if (want === "fr") return /\b(fre|french|fra)\b/i.test(name);
+        if (want === "de") return /\b(ger|german|deu)\b/i.test(name);
+        return name.includes(want);
+      });
+      if (nameMatch !== undefined) return nameMatch;
+    }
   }
   // No preferred language among the playable ones: the file's own order
   // decides, but still only among tracks that will actually make a sound.
@@ -521,6 +537,7 @@ export class MediabunnyPlayer {
       audioTracks.map((track) => track.languageCode || ""),
       this.options.preferredLanguages ?? [],
       this.audioDecodable,
+      audioTracks.map((track) => track.name ?? undefined),
     );
     const audio = this.audioDecodable[this.audioIndex]
       ? (audioTracks[this.audioIndex] ?? null)
@@ -566,7 +583,7 @@ export class MediabunnyPlayer {
       this.canvas.width = width;
       this.canvas.height = height;
       this.videoSink = new CanvasSink(track, {
-        poolSize: 2,
+        poolSize: 4,
         fit: "contain",
       });
     }
@@ -694,22 +711,9 @@ export class MediabunnyPlayer {
     this.silence();
     this.pausedAt = target;
     if (!keepStatus) this.report("buffering", "");
-    // A still frame at the destination, so scrubbing shows where it landed
-    // rather than freezing on where it left.
-    if (this.videoSink) {
-      /*
-       * A frame here is a courtesy, not a requirement.
-       *
-       * This draws a still at the destination so scrubbing shows where it
-       * landed. Throwing when one cannot be produced turned a cosmetic miss
-       * into the end of playback — and the first thing a resumed episode does
-       * is seek to its saved position, so the same file played or died
-       * depending on where you left off. That is what made it intermittent.
-       *
-       * The decode loop is what actually has to work, and it reports for
-       * itself. If nothing ever reaches the canvas the player says so after a
-       * few seconds; until then, playing on with no still beats stopping.
-       */
+    // A still frame at the destination when scrubbing while paused.
+    // When actively playing, skip this redundant decode step so playback resumes immediately.
+    if (!wasPlaying && this.videoSink) {
       const frame = await this.videoSink.getCanvas(target).catch(() => null);
       if (this.stopped || this.generation !== generation) return;
       if (frame) this.draw(frame);
@@ -865,7 +869,8 @@ export class MediabunnyPlayer {
     if (this.stopped) return;
     const context = this.canvas.getContext("2d");
     if (!context) return;
-    context.clearRect(0, 0, this.canvas.width, this.canvas.height);
+    // Frame is opaque video: drawing it directly overwrites the canvas.
+    // Calling clearRect on a 4K canvas (33MB) 60x/sec causes severe memory bandwidth stall.
     context.drawImage(frame.canvas, 0, 0, this.canvas.width, this.canvas.height);
     this.drawn += 1;
   }
@@ -989,14 +994,29 @@ export class MediabunnyPlayer {
     if (!this.videoSink) return;
     const start = this.startedFrom;
     let pending: WrappedCanvas | null = null;
+    let isFirstFrame = true;
+
     for await (const frame of this.videoSink.canvases(start)) {
       if (this.videoGeneration !== generation || this.stopped) return;
-      // Decoding has to begin at the keyframe before the resume point, so the
-      // first frames out of it are ones already watched. Drawing them rewinds
-      // the picture a second or two before it jumps forward again.
-      if (frame.timestamp < start) continue;
-      // Held until its moment, then drawn — the audio clock decides when, so
-      // the two stay together rather than drifting apart.
+
+      // The first frame yielded by canvases(start) is the frame covering or immediately
+      // following our seek position. Render it immediately so the user sees the new position
+      // and release the audio clock without any deadlock delay.
+      if (isFirstFrame) {
+        isFirstFrame = false;
+        this.draw(frame);
+        this.startedFrom = frame.timestamp;
+        this.releasePicture?.();
+        continue;
+      }
+
+      // Frame dropping: If video decoding/rendering has fallen behind the audio clock
+      // by more than 50ms (e.g. during heavy 4K playback), drop stale frames to keep
+      // audio and video in sync and prevent progressive choppiness.
+      if (this.currentTime - frame.timestamp > 0.05) {
+        continue;
+      }
+
       pending = frame;
       // Paused, the clock has stopped and this waits here holding the frame it
       // was about to draw — which is exactly where an unpause needs it.
@@ -1006,8 +1026,6 @@ export class MediabunnyPlayer {
       }
       if (pending) {
         this.draw(pending);
-        // The picture is back, so the clock and the sound may start.
-        this.releasePicture?.();
       }
       pending = null;
     }

@@ -306,6 +306,62 @@ function sourceLabel(item: Stream) {
   );
 }
 
+/** Extracts the clean first line or filename for video quality description. */
+function cleanReleaseTitle(item: Stream): string {
+  if (item.behaviorHints?.filename) return item.behaviorHints.filename;
+  const label = sourceLabel(item);
+  if (!label) return "";
+  const firstLine = label.split("\n")[0].trim();
+  return firstLine;
+}
+
+/** Parses torrent infoHash and fileIdx from stream fields or URL. */
+function parseTorrentStatsTarget(stream: Stream): { hash: string; fileIdx: number } | null {
+  if (stream.infoHash && /^[0-9a-f]{40}$/i.test(stream.infoHash.trim())) {
+    return {
+      hash: stream.infoHash.trim().toLowerCase(),
+      fileIdx: stream.fileIdx ?? 0,
+    };
+  }
+  const checkUrl = stream.url || stream.externalUrl;
+  if (checkUrl) {
+    const match = checkUrl.match(/\/streaming\/([0-9a-fA-F]{40})\/(\d+)/i);
+    if (match) {
+      return {
+        hash: match[1].toLowerCase(),
+        fileIdx: parseInt(match[2], 10) || 0,
+      };
+    }
+  }
+  return null;
+}
+
+function formatSpeed(bytesPerSec: number): string {
+  if (!bytesPerSec || bytesPerSec <= 0) return "0 KB/s";
+  if (bytesPerSec < 1024 * 1024) {
+    return `${(bytesPerSec / 1024).toFixed(1)} KB/s`;
+  }
+  return `${(bytesPerSec / (1024 * 1024)).toFixed(1)} MB/s`;
+}
+
+function formatBytes(bytes: number): string {
+  if (!bytes || bytes <= 0) return "0 B";
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+type TorrentLiveStats = {
+  downloadSpeed: number;
+  uploadSpeed: number;
+  downloaded: number;
+  streamLen: number;
+  streamProgress: number;
+  peers: number;
+  swarmSize: number;
+  streamName?: string;
+};
+
 export type PlayerProps = {
   stream: Stream;
   meta: Meta;
@@ -615,6 +671,106 @@ export function Player({
   const closingRef = useRef(false);
   const [infoOpen, setInfoOpen] = useState(false);
   const [diagnostics, setDiagnostics] = useState<PlayerState["diagnostics"]>();
+  const [torrentStats, setTorrentStats] = useState<TorrentLiveStats | null>(null);
+  const [bufferAheadSec, setBufferAheadSec] = useState<number>(0);
+  const [streamResolution, setStreamResolution] = useState<{ width: number; height: number } | null>(null);
+  const cleanRelease = useMemo(() => cleanReleaseTitle(stream), [stream]);
+
+  // Live BitTorrent telemetry from companion streaming server
+  useEffect(() => {
+    const target = parseTorrentStatsTarget(stream);
+    if (!target) {
+      setTorrentStats(null);
+      return;
+    }
+    let live = true;
+    const pollStats = async () => {
+      try {
+        const res = await fetch(`/streaming/${target.hash}/${target.fileIdx}/stats.json`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (live && data) {
+          setTorrentStats({
+            downloadSpeed: Number(data.downloadSpeed) || 0,
+            uploadSpeed: Number(data.uploadSpeed) || 0,
+            downloaded: Number(data.downloaded) || 0,
+            streamLen: Number(data.streamLen) || 0,
+            streamProgress: Number(data.streamProgress) || 0,
+            peers: Number(data.peers ?? data.swarmConnections) || 0,
+            swarmSize: Number(data.swarmSize) || 0,
+            streamName: data.streamName || data.name || undefined,
+          });
+        }
+      } catch {
+        // ignore network dropouts
+      }
+    };
+
+    void pollStats();
+    const interval = setInterval(pollStats, 1500);
+    return () => {
+      live = false;
+      clearInterval(interval);
+    };
+  }, [stream]);
+
+  // Buffer health and decoded dimensions
+  useEffect(() => {
+    const checkMedia = () => {
+      const v = videoRef.current;
+      let calculatedAhead = 0;
+      if (v) {
+        if (v.videoWidth && v.videoHeight) {
+          setStreamResolution((prev) => {
+            if (prev?.width === v.videoWidth && prev?.height === v.videoHeight) return prev;
+            return { width: v.videoWidth, height: v.videoHeight };
+          });
+        }
+        if (v.buffered && v.buffered.length > 0) {
+          const current = v.currentTime;
+          for (let i = 0; i < v.buffered.length; i++) {
+            if (v.buffered.start(i) <= current && current <= v.buffered.end(i)) {
+              calculatedAhead = Math.max(0, v.buffered.end(i) - current);
+              break;
+            }
+          }
+        }
+      }
+
+      // If video element has no buffer ranges (e.g. Canvas/WebCodecs decoding), calculate from server cache
+      if (calculatedAhead === 0 && torrentStats && torrentStats.streamLen > 0 && duration > 0) {
+        const playedBytes = (currentTime / duration) * torrentStats.streamLen;
+        const bufferBytesAhead = Math.max(0, torrentStats.downloaded - playedBytes);
+        calculatedAhead = (bufferBytesAhead / torrentStats.streamLen) * duration;
+      }
+      setBufferAheadSec(calculatedAhead);
+    };
+
+    const interval = setInterval(checkMedia, 1000);
+    return () => clearInterval(interval);
+  }, [torrentStats, currentTime, duration]);
+
+  const telemetryPill = useMemo(() => {
+    if (torrentStats && torrentStats.streamLen > 0) {
+      const speed = torrentStats.downloadSpeed;
+      const speedStr = speed > 0 ? formatSpeed(speed) : null;
+      const downloadedStr = formatBytes(torrentStats.downloaded);
+      const totalStr = formatBytes(torrentStats.streamLen);
+      const pct = Math.min(100, Math.round((torrentStats.downloaded / torrentStats.streamLen) * 100));
+
+      if (pct >= 99) {
+        return `⚡ ${totalStr} cached (100%) · ${torrentStats.peers}p`;
+      }
+      if (speedStr) {
+        return `⬇️ ${speedStr} · ${downloadedStr} / ${totalStr} (${pct}%) · ${torrentStats.peers}p`;
+      }
+      return `⬇️ ${downloadedStr} / ${totalStr} (${pct}%) · ${torrentStats.peers}p`;
+    }
+    if (bufferAheadSec > 0) {
+      return `⚡ Direct · +${Math.round(bufferAheadSec)}s buffer`;
+    }
+    return null;
+  }, [torrentStats, bufferAheadSec]);
   // WebView2 must stay opaque until libmpv reports playback-restart.  Before
   // that event its child video window can still be transparent, which would
   // otherwise expose whatever desktop window happens to sit behind Nuvio.
@@ -2453,7 +2609,7 @@ export function Player({
         <button className="circle-button" aria-label="Back" onClick={closePlayer}>
           <ArrowLeft />
         </button>
-        <div>
+        <div className="player-meta-heading">
           <small>
             {video?.season
               ? `Season ${video.season} · Episode ${video.episode}`
@@ -2463,12 +2619,40 @@ export function Player({
               : ""}
           </small>
           <strong>{video?.title || meta.name}</strong>
+          <div className="player-quality-bar">
+            {stream.addonName && (
+              <span className="player-addon-badge">{stream.addonName}</span>
+            )}
+            {streamBadgeSettings && (
+              <SourceBadges stream={stream} settings={streamBadgeSettings} />
+            )}
+            {cleanRelease && (
+              <span className="player-release-title" title={cleanRelease}>
+                {cleanRelease}
+              </span>
+            )}
+          </div>
         </div>
-        {endsAt && (
-          <span className="player-ends-at" title="Estimated finish time">
-            Ends at {endsAt}
-          </span>
-        )}
+        <div className="player-top-status">
+          {telemetryPill && (
+            <button
+              type="button"
+              className="player-telemetry-pill"
+              title="Click for live stream telemetry & download stats"
+              onClick={() => {
+                showControls();
+                setInfoOpen((open) => !open);
+              }}
+            >
+              {telemetryPill}
+            </button>
+          )}
+          {endsAt && (
+            <span className="player-ends-at" title="Estimated finish time">
+              Ends at {endsAt}
+            </span>
+          )}
+        </div>
       </div>
       {!error && waiting && settings.showLoadingOverlay && (
         <div className="player-center player-center-busy" aria-label="Loading">
@@ -2536,38 +2720,51 @@ export function Player({
                 <span>{formatTime(seekThumbnail.time)}</span>
               </div>
             )}
-            <input
-              aria-label="Seek"
-              type="range"
-              min="0"
-              max={seekLimit}
-              step="0.1"
-              value={Math.min(displayedTime, seekLimit)}
-              onChange={(event) => {
-                const target = Number(event.target.value);
-                seekPreviewRef.current = target;
-                setSeekPreview(target);
-              }}
-              onPointerUp={(event) =>
-                commitSeekPreview(Number(event.currentTarget.value))
-              }
-              onKeyUp={(event) => {
-                if (
-                  event.key.startsWith("Arrow") ||
-                  event.key === "Home" ||
-                  event.key === "End"
-                )
-                  commitSeekPreview(Number(event.currentTarget.value));
-              }}
-              onBlur={(event) => {
-                commitSeekPreview(Number(event.currentTarget.value));
-              }}
-              style={
-                {
-                  "--played": `${seekLimit ? (displayedTime / seekLimit) * 100 : 0}%`,
-                } as CSSProperties
-              }
-            />
+            {(() => {
+              const diskPercent =
+                torrentStats && torrentStats.streamLen > 0
+                  ? Math.min(100, (torrentStats.downloaded / torrentStats.streamLen) * 100)
+                  : bufferAheadSec > 0 && duration > 0
+                    ? Math.min(100, ((displayedTime + bufferAheadSec) / duration) * 100)
+                    : 0;
+              const playedPercent = seekLimit ? (displayedTime / seekLimit) * 100 : 0;
+              const bufferedPercent = Math.max(playedPercent, diskPercent);
+              return (
+                <input
+                  aria-label="Seek"
+                  type="range"
+                  min="0"
+                  max={seekLimit}
+                  step="0.1"
+                  value={Math.min(displayedTime, seekLimit)}
+                  onChange={(event) => {
+                    const target = Number(event.target.value);
+                    seekPreviewRef.current = target;
+                    setSeekPreview(target);
+                  }}
+                  onPointerUp={(event) =>
+                    commitSeekPreview(Number(event.currentTarget.value))
+                  }
+                  onKeyUp={(event) => {
+                    if (
+                      event.key.startsWith("Arrow") ||
+                      event.key === "Home" ||
+                      event.key === "End"
+                    )
+                      commitSeekPreview(Number(event.currentTarget.value));
+                  }}
+                  onBlur={(event) => {
+                    commitSeekPreview(Number(event.currentTarget.value));
+                  }}
+                  style={
+                    {
+                      "--played": `${playedPercent}%`,
+                      "--buffered": `${bufferedPercent}%`,
+                    } as CSSProperties
+                  }
+                />
+              );
+            })()}
           </div>
           <span>{formatTime(duration)}</span>
         </div>
@@ -3073,32 +3270,120 @@ export function Player({
                 <PictureModeGlyph />
               </button>
             )}
-            {nativePlayer && (
-              <button aria-label="Playback information" title="Playback information" aria-expanded={infoOpen}
-                onClick={() => { showControls(); setInfoOpen((open) => !open); }}>
-                <Info />
-              </button>
-            )}
+            <button
+              aria-label="Stream Telemetry & Stats"
+              title="Stream Telemetry & Stats"
+              className={infoOpen ? "active" : ""}
+              aria-expanded={infoOpen}
+              onClick={() => {
+                showControls();
+                setInfoOpen((open) => !open);
+              }}
+            >
+              <Gauge />
+            </button>
             <button aria-label={t("player.fullscreen")} onClick={toggleFullscreen}>
               <Maximize />
             </button>
           </div>
         </div>
       </div>
-      {nativePlayer && infoOpen && (
-        <section className="player-diagnostics" aria-label="Playback information">
-          <header><strong>Playback information</strong><button aria-label="Close playback information" onClick={() => setInfoOpen(false)}><X size={18} /></button></header>
-          {diagnostics ? <dl>
-            <dt>RTX requested</dt><dd>{diagnostics.rtxRequested ? "On for this stream" : "Off for this stream"}</dd>
-            <dt>Hardware decoder</dt><dd>{diagnostics.hardwareDecoder || "Not reported yet"}</dd>
-            <dt>GPU API setting</dt><dd>{diagnostics.gpuApi || "Not reported yet"}</dd>
-            <dt>Video codec</dt><dd>{diagnostics.videoCodec || "Not reported yet"}</dd>
-            <dt>Decoded video</dt><dd>{diagnostics.sourceWidth && diagnostics.sourceHeight ? `${diagnostics.sourceWidth} × ${diagnostics.sourceHeight}` : "Not reported yet"}</dd>
-            <dt>After video filters</dt><dd>{diagnostics.outputWidth && diagnostics.outputHeight ? `${diagnostics.outputWidth} × ${diagnostics.outputHeight}` : "Not reported yet"}</dd>
-            <dt>Video filters</dt><dd>{diagnostics.videoFilters || "None reported"}</dd>
-          </dl> : <p>Waiting for mpv diagnostics…</p>}
-          <p>For RTX, look for d3d11va and a d3d11vpp filter with scaling-mode=nvidia. Larger output dimensions show scaling. These are live mpv readings; they do not confirm NVIDIA driver enhancement activity.</p>
-          {warning && <p>{warning}</p>}
+      {infoOpen && (
+        <section
+          className="player-diagnostics"
+          aria-label="Playback & Stream Telemetry"
+          onMouseEnter={showControls}
+          onMouseMove={showControls}
+        >
+          <header>
+            <strong>Stream Telemetry & Stats</strong>
+            <button aria-label="Close telemetry" onClick={() => setInfoOpen(false)}>
+              <X size={18} />
+            </button>
+          </header>
+
+          <div className="telemetry-block">
+            <span className="telemetry-subtitle">Stream & Quality</span>
+            <dl>
+              <dt>Source Addon</dt>
+              <dd>{stream.addonName || "Unknown"}</dd>
+              <dt>Release Title</dt>
+              <dd className="telemetry-truncate" title={cleanRelease}>{cleanRelease || stream.name || "Default release"}</dd>
+              {streamResolution && (
+                <>
+                  <dt>Decoded Resolution</dt>
+                  <dd>{streamResolution.width} × {streamResolution.height}</dd>
+                </>
+              )}
+              {selectedAudioLabel && (
+                <>
+                  <dt>Audio Track</dt>
+                  <dd>{selectedAudioLabel}</dd>
+                </>
+              )}
+            </dl>
+          </div>
+
+          {torrentStats && torrentStats.streamLen > 0 ? (
+            <div className="telemetry-block">
+              <span className="telemetry-subtitle">Live Torrent Swarm (Companion)</span>
+              <dl>
+                <dt>Download Speed</dt>
+                <dd className="telemetry-accent">{formatSpeed(torrentStats.downloadSpeed)}</dd>
+                <dt>Downloaded to Disk</dt>
+                <dd>
+                  {formatBytes(torrentStats.downloaded)} / {formatBytes(torrentStats.streamLen)} (
+                  {Math.min(100, Math.round((torrentStats.downloaded / torrentStats.streamLen) * 100))}%)
+                </dd>
+                <dt>Active Peers</dt>
+                <dd>{torrentStats.peers} connected ({torrentStats.swarmSize} in swarm)</dd>
+                <dt>Buffer Lead</dt>
+                <dd>+{bufferAheadSec.toFixed(1)}s ahead</dd>
+              </dl>
+              <div className="telemetry-progress-track">
+                <div
+                  className="telemetry-progress-bar"
+                  style={{ width: `${Math.min(100, Math.round((torrentStats.downloaded / torrentStats.streamLen) * 100))}%` }}
+                />
+              </div>
+            </div>
+          ) : (
+            <div className="telemetry-block">
+              <span className="telemetry-subtitle">Stream Buffer & Health</span>
+              <dl>
+                <dt>Delivery</dt>
+                <dd>Direct HTTP / HLS Stream</dd>
+                <dt>Buffer Lead</dt>
+                <dd>+{bufferAheadSec.toFixed(1)}s ahead</dd>
+                {stream.behaviorHints?.videoSize ? (
+                  <>
+                    <dt>File Size</dt>
+                    <dd>{formatBytes(stream.behaviorHints.videoSize)}</dd>
+                  </>
+                ) : null}
+              </dl>
+            </div>
+          )}
+
+          {nativePlayer && (
+            <div className="telemetry-block">
+              <span className="telemetry-subtitle">Native mpv Diagnostics</span>
+              {diagnostics ? (
+                <dl>
+                  <dt>RTX requested</dt><dd>{diagnostics.rtxRequested ? "On for this stream" : "Off for this stream"}</dd>
+                  <dt>Hardware decoder</dt><dd>{diagnostics.hardwareDecoder || "Not reported yet"}</dd>
+                  <dt>GPU API setting</dt><dd>{diagnostics.gpuApi || "Not reported yet"}</dd>
+                  <dt>Video codec</dt><dd>{diagnostics.videoCodec || "Not reported yet"}</dd>
+                  <dt>Decoded video</dt><dd>{diagnostics.sourceWidth && diagnostics.sourceHeight ? `${diagnostics.sourceWidth} × ${diagnostics.sourceHeight}` : "Not reported yet"}</dd>
+                  <dt>After video filters</dt><dd>{diagnostics.outputWidth && diagnostics.outputHeight ? `${diagnostics.outputWidth} × ${diagnostics.outputHeight}` : "Not reported yet"}</dd>
+                  <dt>Video filters</dt><dd>{diagnostics.videoFilters || "None reported"}</dd>
+                </dl>
+              ) : (
+                <p>Waiting for mpv diagnostics…</p>
+              )}
+            </div>
+          )}
+          {warning && <p className="telemetry-warning">{warning}</p>}
         </section>
       )}
       {skippable && !error && (

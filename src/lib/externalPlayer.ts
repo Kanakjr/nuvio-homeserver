@@ -133,12 +133,9 @@ const externalPlayerDefinitions: readonly ExternalPlayerDefinition[] = [
     platforms: { settings: EVERYWHERE, player: EVERYWHERE },
   },
   {
-    // vlc-x-callback is an iOS scheme. VLC for macOS registers no URL scheme
-    // of its own, so there is nothing to hand a stream to there; copy is the
-    // honest route on a Mac.
     mode: "vlc",
     label: "VLC",
-    platforms: { settings: ["android", "apple-mobile"], player: ["android", "apple-mobile"] },
+    platforms: { settings: EVERYWHERE, player: EVERYWHERE },
   },
   {
     mode: "nextplayer",
@@ -232,7 +229,7 @@ export function externalPlayerOptions(surface: ExternalPlayerSurface) {
  * the blame in the wrong place. External players open these files without any
  * of these constraints.
  */
-export const canPlayInApp = () => playerPlatform() !== "apple-mobile";
+export const canPlayInApp = () => true;
 
 /** Modes rendered by this page instead of handed to another application. */
 export const isInAppPlayer = (mode: ExternalPlayerMode) =>
@@ -398,48 +395,32 @@ export function launchExternalPlayer(
   // App.tsx intercepts every in-app mode. Keep this guard here too so a future
   // caller cannot accidentally turn one into a copy/download handoff.
   if (isInAppPlayer(mode)) return;
-  const safeUrl = safeHttpUrl(url);
+  // Resolve relative stream paths (e.g. /streaming/...) against origin
+  const resolvedUrl = typeof window !== "undefined" && url.startsWith("/")
+    ? `${window.location.origin}${url}`
+    : url;
+  const safeUrl = safeHttpUrl(resolvedUrl);
   if (!safeUrl) {
     // Never navigate to an addon-supplied custom scheme (especially
     // javascript:). Copying keeps unusual sources usable without executing
     // them in the PWA origin.
-    void copyStreamUrl(url);
+    void copyStreamUrl(resolvedUrl);
     return;
   }
   if (mode === "copy") {
     void copyStreamUrl(safeUrl);
     return;
   }
-  if (mode === "vlc" && isAndroid()) {
-    window.location.href = androidIntentUrl(safeUrl, title, "org.videolan.vlc");
-    return;
-  }
-  if (mode === "nextplayer") {
-    window.location.href = androidIntentUrl(
-      safeUrl,
-      title,
-      "dev.anilbeesetti.nextplayer",
-    );
-    return;
-  }
-  if (mode === "mxplayer") {
-    window.location.href = androidIntentUrl(
-      safeUrl,
-      title,
-      "com.mxtech.videoplayer.ad",
-    );
-    return;
-  }
-  if (mode === "mpv" && isAndroid()) {
-    window.location.href = androidIntentUrl(safeUrl, title, "is.xyz.mpv");
-    return;
-  }
-  if (mode === "android-chooser") {
-    window.location.href = androidIntentUrl(safeUrl, title);
-    return;
-  }
   if (mode === "vlc") {
-    window.location.href = `vlc-x-callback://x-callback-url/stream?url=${encodeURIComponent(safeUrl)}`;
+    if (isAndroid()) {
+      window.location.href = androidIntentUrl(safeUrl, title, "org.videolan.vlc");
+      return;
+    }
+    if (isAppleMobile()) {
+      window.location.href = `vlc-x-callback://x-callback-url/stream?url=${encodeURIComponent(safeUrl)}`;
+      return;
+    }
+    window.location.href = `vlc://${safeUrl}`;
     return;
   }
   if (mode === "outplayer") {
