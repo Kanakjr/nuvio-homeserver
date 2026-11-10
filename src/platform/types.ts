@@ -64,6 +64,10 @@ export type AuthApi = {
   ): Promise<Session>;
   /** Resumes a stored session, rotating whatever credential persisted it. */
   restore(): Promise<Session>;
+  setSessionTokens?(
+    backend: BackendConfig,
+    tokens: Record<string, unknown>,
+  ): Promise<Session>;
   signOut(): Promise<void>;
   /** One authorized call against the account backend, made on our behalf. */
   request<T>(

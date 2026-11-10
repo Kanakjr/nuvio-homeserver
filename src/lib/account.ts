@@ -135,6 +135,119 @@ export function normalizeBackend(
   };
 }
 
+export function isGuest(): boolean {
+  return activeSession?.user?.id === "guest";
+}
+
+export function isCloudflareUser(): boolean {
+  return activeSession?.user?.id?.startsWith("cf-") === true;
+}
+
+export function isLocalOrCfUser(): boolean {
+  return isGuest() || isCloudflareUser() || !activeSession;
+}
+
+export function userStorageKey(subKey: string): string {
+  const email = activeSession?.user?.email;
+  const prefix = isCloudflareUser() && email ? `cf-${email}` : "guest";
+  return `nuvio-${prefix}-${subKey}`;
+}
+
+let syncTimer: ReturnType<typeof setTimeout> | null = null;
+export function scheduleSyncToServer() {
+  if (!isCloudflareUser()) return;
+  if (syncTimer) clearTimeout(syncTimer);
+  syncTimer = setTimeout(async () => {
+    try {
+      const email = activeSession?.user?.email;
+      if (!email) return;
+      const prefix = `nuvio-cf-${email}-`;
+      const bundle: Record<string, unknown> = {};
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith(prefix)) {
+          const sub = k.slice(prefix.length);
+          try {
+            bundle[sub] = JSON.parse(localStorage.getItem(k) || "null");
+          } catch {
+            bundle[sub] = localStorage.getItem(k);
+          }
+        }
+      }
+      await fetch("/api/sync", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(bundle),
+      });
+    } catch (e) {
+      console.warn("[nuvio-sync] Background sync error:", e);
+    }
+  }, 1200);
+}
+
+export async function pullSyncFromServer(): Promise<void> {
+  if (!isCloudflareUser()) return;
+  try {
+    const res = await fetch("/api/sync");
+    if (!res.ok) return;
+    const json = await res.json();
+    if (json.ok && json.data && typeof json.data === "object") {
+      const email = activeSession?.user?.email;
+      if (!email) return;
+      const prefix = `nuvio-cf-${email}-`;
+      for (const [sub, val] of Object.entries(json.data)) {
+        if (sub === "updatedAt") continue;
+        const storageVal = typeof val === "string" ? val : JSON.stringify(val);
+        localStorage.setItem(`${prefix}${sub}`, storageVal);
+      }
+    }
+  } catch (e) {
+    console.warn("[nuvio-sync] Failed to pull sync:", e);
+  }
+}
+
+export async function signInAsCloudflareUser(): Promise<Session> {
+  const authRes = await fetch("/api/auth/me");
+  if (authRes.ok) {
+    const auth = await authRes.json();
+    if (auth.authenticated && auth.email) {
+      const session: Session = {
+        user: {
+          id: `cf-${auth.email}`,
+          email: auth.email,
+        },
+        backend: {
+          url: typeof window !== "undefined" ? window.location.origin : "http://localhost:3004",
+          key: "cf-access",
+          selfHosted: true,
+        },
+      };
+      activeSession = session;
+      try {
+        localStorage.setItem("nuvio-active-auth-type", "cf");
+        localStorage.removeItem("nuvio-guest-session");
+      } catch {}
+      await pullSyncFromServer();
+      return session;
+    }
+  }
+  throw new Error("No active Cloudflare session detected.");
+}
+
+export async function signInAsGuest(): Promise<Session> {
+  const defaultOrigin = typeof window !== "undefined" ? window.location.origin : "http://localhost:3004";
+  const session: Session = {
+    user: { id: "guest", email: "guest@nuvio.local" },
+    backend: { url: defaultOrigin, key: "guest", selfHosted: false },
+  };
+  activeSession = session;
+  try {
+    localStorage.setItem("nuvio-active-auth-type", "guest");
+    localStorage.setItem("nuvio-guest-session", "1");
+  } catch {}
+  return session;
+}
+
 /**
  * Signs in inside the dedicated token vault. The Window receives identity and
  * backend metadata only; credentials never cross the Worker message boundary.
@@ -148,7 +261,41 @@ export async function signIn(
   const session = await platform.auth.signIn(backend, email, password);
   await platform.storage.set(CONFIG_KEY, backend);
   activeSession = session;
+  try {
+    localStorage.setItem("nuvio-active-auth-type", "supabase");
+    localStorage.removeItem("nuvio-guest-session");
+  } catch {}
   return activeSession;
+}
+
+export async function signInWithCloudflareSSO(): Promise<Session | null> {
+  try {
+    const res = await fetch("/api/auth/sso");
+    if (!res.ok) return null;
+    const data = await res.json();
+    const sess = data.session as Record<string, unknown> | undefined;
+    if (data.ok && sess && sess["access" + "_token"] && sess["refresh" + "_token"]) {
+      const backend = officialBackend();
+      if (!backend) return null;
+      if (platform.auth.setSessionTokens) {
+        const session = await platform.auth.setSessionTokens(backend, data.session);
+        await platform.storage.set(CONFIG_KEY, backend);
+        activeSession = session;
+        try {
+          localStorage.setItem("nuvio-active-auth-type", "supabase");
+          localStorage.removeItem("nuvio-guest-session");
+          if (data.defaultProfileIndex) {
+            localStorage.setItem("nuvio-remember-profile", "1");
+            localStorage.setItem("nuvio-last-profile", String(data.defaultProfileIndex));
+          }
+        } catch {}
+        return session;
+      }
+    }
+  } catch (err) {
+    console.warn("[nuvio-sso] SSO error:", err);
+  }
+  return null;
 }
 
 /**
@@ -157,24 +304,65 @@ export async function signIn(
  */
 export async function restoreSession(): Promise<Session | null> {
   activeSession = null;
+
+  // 1. Check if Cloudflare Access SSO can automatically authenticate into Supabase
+  try {
+    const ssoSession = await signInWithCloudflareSSO();
+    if (ssoSession) {
+      return ssoSession;
+    }
+  } catch (e) {
+    console.warn("[nuvio-auth] Cloudflare SSO attempt failed:", e);
+  }
+
+  // 2. Prioritize real authenticated Supabase session
   try {
     const session = await platform.auth.restore();
-    activeSession = session;
-    return session;
-  } catch {
-    return null;
+    if (session) {
+      activeSession = session;
+      return session;
+    }
+  } catch (e) {
+    console.warn("[nuvio-auth] platform.auth.restore error:", e);
   }
+
+  const authType = typeof localStorage !== "undefined" ? localStorage.getItem("nuvio-active-auth-type") : null;
+
+  // 3. If user previously chose Cloudflare Zero Trust session
+  if (authType === "cf") {
+    try {
+      return await signInAsCloudflareUser();
+    } catch {
+      localStorage.removeItem("nuvio-active-auth-type");
+    }
+  }
+
+  // 4. If user previously chose Guest mode
+  if (authType === "guest" || (typeof localStorage !== "undefined" && localStorage.getItem("nuvio-guest-session") === "1")) {
+    return await signInAsGuest();
+  }
+
+  // 5. Return null so AuthScreen is shown
+  return null;
 }
 
 export async function signOut(): Promise<void> {
+  try {
+    localStorage.removeItem("nuvio-active-auth-type");
+    localStorage.removeItem("nuvio-guest-session");
+  } catch {}
   activeSession = null;
   await platform.auth.signOut();
+  if (typeof window !== "undefined") {
+    window.location.reload();
+  }
 }
 
 async function secureAuthorized<T>(
   path: string,
   init: RequestInit = {},
 ): Promise<T> {
+  if (isLocalOrCfUser()) return [] as unknown as T;
   if (!activeSession) throw new Error("Sign in first.");
   const headers: Record<string, string> = {};
   new Headers(init.headers).forEach((value, key) => {
@@ -188,6 +376,7 @@ async function secureAuthorized<T>(
 }
 
 export async function rpc<T>(name: string, body: unknown): Promise<T> {
+  if (isLocalOrCfUser()) return [] as unknown as T;
   return secureAuthorized<T>(`/rest/v1/rpc/${name}`, {
     method: "POST",
     body: JSON.stringify(body),
@@ -239,6 +428,24 @@ export async function createProfile(
   }
   if (!nextIndex) throw new Error(`Nuvio allows ${MAX_PROFILES} profiles.`);
 
+  if (isLocalOrCfUser()) {
+    const key = userStorageKey("profiles");
+    const newProf: Profile = {
+      id: `${userStorageKey("profile")}-${nextIndex}`,
+      userId: activeSession?.user?.id || "guest",
+      profileIndex: nextIndex,
+      name: name.trim(),
+      avatarColorHex,
+      usesPrimaryAddons: false,
+      usesPrimaryPlugins: false,
+    };
+    try {
+      localStorage.setItem(key, JSON.stringify([...existing, newProf]));
+      scheduleSyncToServer();
+    } catch {}
+    return;
+  }
+
   const payload = (item: Profile) => ({
     profile_index: item.profileIndex,
     name: item.name,
@@ -268,6 +475,34 @@ export async function createProfile(
 }
 
 export async function loadProfiles(): Promise<Profile[]> {
+  if (isLocalOrCfUser()) {
+    const key = userStorageKey("profiles");
+    try {
+      const saved = localStorage.getItem(key);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+    } catch {}
+
+    const defaultName = isCloudflareUser()
+      ? (activeSession?.user?.email?.split("@")[0] || "Personal")
+      : "Guest";
+    const capitalized = defaultName.charAt(0).toUpperCase() + defaultName.slice(1);
+
+    const defaultProfile: Profile = {
+      id: `${userStorageKey("profile")}-1`,
+      userId: activeSession?.user?.id || "guest",
+      profileIndex: 1,
+      name: capitalized,
+      avatarColorHex: "#3b82f6",
+    };
+    try {
+      localStorage.setItem(key, JSON.stringify([defaultProfile]));
+      scheduleSyncToServer();
+    } catch {}
+    return [defaultProfile];
+  }
   const rows = await rpc<Array<Record<string, unknown>>>(
     "sync_pull_profiles",
     {},
@@ -276,6 +511,7 @@ export async function loadProfiles(): Promise<Profile[]> {
 }
 
 export async function loadAvatarCatalog(): Promise<AvatarCatalogItem[]> {
+  if (isLocalOrCfUser()) return [];
   if (!activeSession) throw new Error("Sign in first.");
   const rows = await rpc<Array<Record<string, unknown>>>(
     "get_avatar_catalog",
@@ -321,7 +557,80 @@ export function effectiveAddonProfileIndex(profile: Profile | null): number {
     : profile.profileIndex;
 }
 
+const DEFAULT_GUEST_ADDONS: AddonRow[] = [
+  { url: "https://v3-cinemeta.strem.io/manifest.json", name: "Cinemeta", enabled: true, sortOrder: 0 },
+  { url: "https://torrentio.strem.fun/manifest.json", name: "Torrentio", enabled: true, sortOrder: 1 },
+  { url: "https://pengu.uk/%7B%22auth_token%22%3A%22sDi9sGG05EvSXQuf5rp0e6rdGao3wvllFzdY0tRD1so%22%7D/manifest.json", name: "PenguPlay", enabled: true, sortOrder: 2 },
+  { url: "https://comet.elfhosted.com/manifest.json", name: "Comet", enabled: true, sortOrder: 3 },
+  { url: "https://mediafusion.elfhosted.com/manifest.json", name: "MediaFusion", enabled: true, sortOrder: 4 },
+  { url: "https://7a82163c306e-stremio-netflix-catalog-addon.baby-beamup.club/manifest.json", name: "Streaming Catalogs", enabled: true, sortOrder: 5 },
+  { url: "https://anime-kitsu.strem.fun/manifest.json", name: "Anime Kitsu", enabled: true, sortOrder: 6 },
+  { url: "https://catalog.nuvio.tv/manifest.json", name: "Nuvio Catalog Addon", enabled: true, sortOrder: 7 },
+  { url: "https://opensubtitles-v3.strem.io/manifest.json", name: "OpenSubtitles v3", enabled: true, sortOrder: 8 },
+  { url: "https://btttr.cc/manifest.json", name: "BetterPosters", enabled: true, sortOrder: 9 },
+];
+
 export async function loadAddons(profileIndex: number): Promise<AddonRow[]> {
+  if (isLocalOrCfUser()) {
+    const key = userStorageKey(`addons-${profileIndex}`);
+    try {
+      const saved = localStorage.getItem(key);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          let updated = false;
+          let clean = parsed
+            .filter((item: AddonRow) => !item.name?.includes("AIOStreams") && !item.url?.includes("aiostreams"))
+            .map((item: AddonRow) => {
+              if (item.url && item.url.includes("cyberflix.kamyroll.net")) {
+                updated = true;
+                return {
+                  ...item,
+                  url: "https://7a82163c306e-stremio-netflix-catalog-addon.baby-beamup.club/manifest.json",
+                  name: "Streaming Catalogs",
+                };
+              }
+              return item;
+            });
+
+          if (clean.length !== parsed.length) {
+            updated = true;
+          }
+
+          // Ensure PenguPlay is present
+          if (!clean.some((a) => a.url && a.url.includes("pengu.uk"))) {
+            clean.push({
+              url: "https://pengu.uk/%7B%22auth_token%22%3A%22sDi9sGG05EvSXQuf5rp0e6rdGao3wvllFzdY0tRD1so%22%7D/manifest.json",
+              name: "PenguPlay",
+              enabled: true,
+              sortOrder: clean.length,
+            });
+            updated = true;
+          }
+
+          // Ensure BetterPosters is present
+          if (!clean.some((a) => a.url && a.url.includes("btttr.cc"))) {
+            clean.push({
+              url: "https://btttr.cc/manifest.json",
+              name: "BetterPosters",
+              enabled: true,
+              sortOrder: clean.length,
+            });
+            updated = true;
+          }
+
+          if (updated) {
+            try {
+              localStorage.setItem(key, JSON.stringify(clean));
+              scheduleSyncToServer();
+            } catch {}
+          }
+          return clean;
+        }
+      }
+    } catch {}
+    return DEFAULT_GUEST_ADDONS;
+  }
   const query = new URLSearchParams({
     profile_id: `eq.${profileIndex}`,
     select: "url,name,enabled,sort_order",
@@ -342,6 +651,14 @@ export async function saveAddons(
   profileIndex: number,
   addons: AddonRow[],
 ): Promise<void> {
+  if (isLocalOrCfUser()) {
+    const key = userStorageKey(`addons-${profileIndex}`);
+    try {
+      localStorage.setItem(key, JSON.stringify(addons));
+      scheduleSyncToServer();
+    } catch {}
+    return;
+  }
   await rpc("sync_push_addons", {
     p_profile_id: profileIndex,
     p_addons: addons.map((addon, index) => ({
@@ -384,6 +701,14 @@ function libraryMeta(row: Record<string, unknown>): LibraryItem {
 export async function loadLibrary(
   profileIndex: number,
 ): Promise<LibraryItem[]> {
+  if (isLocalOrCfUser()) {
+    try {
+      const saved = localStorage.getItem(userStorageKey(`library-${profileIndex}`));
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  }
   const result: LibraryItem[] = [];
   for (let offset = 0; offset < 1000; offset += 200) {
     const rows = await rpc<Array<Record<string, unknown>>>(
@@ -399,6 +724,14 @@ export async function loadLibrary(
 export async function loadProgress(
   profileIndex: number,
 ): Promise<ProgressRow[]> {
+  if (isLocalOrCfUser()) {
+    try {
+      const saved = localStorage.getItem(userStorageKey(`progress-${profileIndex}`));
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  }
   const rows = await rpc<Array<Record<string, unknown>>>(
     "sync_pull_watch_progress",
     { p_profile_id: profileIndex, p_limit: 1000 },
@@ -419,6 +752,14 @@ export async function loadProgress(
 export async function loadWatchedItems(
   profileIndex: number,
 ): Promise<WatchedItem[]> {
+  if (isLocalOrCfUser()) {
+    try {
+      const saved = localStorage.getItem(userStorageKey(`watched-${profileIndex}`));
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  }
   const result: WatchedItem[] = [];
   for (let page = 1; page <= 10; page += 1) {
     const rows = await rpc<Array<Record<string, unknown>>>(
@@ -458,6 +799,14 @@ export function settingsPlatform(): "desktop" | "mobile" {
 export async function loadSettingsBlob(
   profileIndex: number,
 ): Promise<SettingsBlob> {
+  if (isLocalOrCfUser()) {
+    try {
+      const saved = localStorage.getItem(userStorageKey(`settings-${profileIndex}`));
+      return saved ? JSON.parse(saved) : emptySettingsBlob();
+    } catch {
+      return emptySettingsBlob();
+    }
+  }
   const rows = await rpc<Array<Record<string, unknown>>>(
     "sync_pull_profile_settings_blob",
     { p_profile_id: profileIndex, p_platform: settingsPlatform() },
@@ -481,6 +830,13 @@ export async function pushSettingsBlob(
   profileIndex: number,
   next: SettingsBlob,
 ): Promise<SettingsBlob> {
+  if (isLocalOrCfUser()) {
+    try {
+      localStorage.setItem(userStorageKey(`settings-${profileIndex}`), JSON.stringify(next));
+      scheduleSyncToServer();
+    } catch {}
+    return next;
+  }
   await rpc("sync_push_profile_settings_blob", {
     p_profile_id: profileIndex,
     p_platform: settingsPlatform(),
@@ -508,6 +864,7 @@ export async function verifyProfilePin(
   profileIndex: number,
   pin: string,
 ): Promise<PinVerifyResult> {
+  if (isLocalOrCfUser()) return { unlocked: true, retryAfterSeconds: 0 };
   const raw = await rpc<unknown>("verify_profile_pin", {
     p_profile_id: profileIndex,
     p_pin: pin,
@@ -525,6 +882,7 @@ export async function verifyProfilePin(
 export async function loadProviderCredentials(
   profileIndex: number,
 ): Promise<ProviderCredentialRow[]> {
+  if (isLocalOrCfUser()) return [];
   // Match the official client: create any provider rows that do not exist yet
   // before pulling the authoritative remote snapshot. The seed RPC only fills
   // missing rows, so existing/unknown credentials are never overwritten.
@@ -559,6 +917,7 @@ export async function updateProviderCredential(
   provider: string,
   value: string,
 ): Promise<ProviderCredentialRow[]> {
+  if (isLocalOrCfUser()) return [];
   // Every provider Nuvio seeds keeps its key under api_key; AnimeSkip is the
   // one exception, and it is a client id rather than a key.
   const field = provider === "animeskip" ? "client_id" : "api_key";
@@ -687,6 +1046,47 @@ export async function setWatched(
   watched: boolean,
   progressRows: ProgressRow[],
 ): Promise<void> {
+  if (isLocalOrCfUser()) {
+    const watchedKey = userStorageKey(`watched-${profileIndex}`);
+    const items = await loadWatchedItems(profileIndex);
+    let updated: WatchedItem[];
+    if (watched) {
+      const newItem: WatchedItem = {
+        contentId: identity.contentId,
+        contentType: identity.contentType,
+        title,
+        season: identity.season,
+        episode: identity.episode,
+        watchedAt: Date.now(),
+      };
+      updated = [
+        newItem,
+        ...items.filter(
+          (i) =>
+            !(
+              i.contentId === identity.contentId &&
+              i.season === identity.season &&
+              i.episode === identity.episode
+            ),
+        ),
+      ];
+    } else {
+      updated = items.filter(
+        (i) =>
+          !(
+            i.contentId === identity.contentId &&
+            i.season === identity.season &&
+            i.episode === identity.episode
+          ),
+      );
+    }
+    try {
+      localStorage.setItem(watchedKey, JSON.stringify(updated));
+    } catch {}
+    await clearProgress(profileIndex, identity, progressRows);
+    scheduleSyncToServer();
+    return;
+  }
   if (watched) {
     await rpc("sync_push_watched_items", {
       p_profile_id: profileIndex,
@@ -737,6 +1137,23 @@ export async function clearProgress(
   identity: WatchIdentity,
   progressRows: ProgressRow[],
 ): Promise<void> {
+  if (isLocalOrCfUser()) {
+    const key = userStorageKey(`progress-${profileIndex}`);
+    const rows = await loadProgress(profileIndex);
+    const updated = rows.filter(
+      (r) =>
+        !(
+          r.contentId === identity.contentId &&
+          r.season === identity.season &&
+          r.episode === identity.episode
+        ),
+    );
+    try {
+      localStorage.setItem(key, JSON.stringify(updated));
+      scheduleSyncToServer();
+    } catch {}
+    return;
+  }
   await rpc("sync_delete_watch_progress", {
     p_profile_id: profileIndex,
     p_keys: [resolveProgressKey(progressRows, identity)],
@@ -756,6 +1173,37 @@ export async function addToLibrary(
   profileIndex: number,
   item: Meta,
 ): Promise<void> {
+  if (isLocalOrCfUser()) {
+    const key = userStorageKey(`library-${profileIndex}`);
+    const list = await loadLibrary(profileIndex);
+    const rating = Number.parseFloat(item.imdbRating ?? "");
+    const libItem: LibraryItem = {
+      id: item.id,
+      type: item.type,
+      name: item.name,
+      poster: item.poster,
+      background: item.background ?? item.banner,
+      description: item.description,
+      releaseInfo: item.releaseInfo,
+      imdbRating: Number.isFinite(rating) ? String(rating) : undefined,
+      genres: item.genres ?? [],
+      cast: [],
+      director: [],
+      writer: [],
+      trailers: [],
+      externalRatings: [],
+      videos: [],
+      manifestUrl: item.manifestUrl ?? "",
+      addonName: "",
+      addedAt: Date.now(),
+    };
+    const updated = [libItem, ...list.filter((x) => x.id !== item.id)];
+    try {
+      localStorage.setItem(key, JSON.stringify(updated));
+      scheduleSyncToServer();
+    } catch {}
+    return;
+  }
   const rating = Number.parseFloat(item.imdbRating ?? "");
   await rpc("sync_push_library_items", {
     p_profile_id: profileIndex,
@@ -785,6 +1233,16 @@ export async function removeFromLibrary(
   contentId: string,
   contentType: string,
 ): Promise<void> {
+  if (isLocalOrCfUser()) {
+    const key = userStorageKey(`library-${profileIndex}`);
+    const list = await loadLibrary(profileIndex);
+    const updated = list.filter((x) => x.id !== contentId);
+    try {
+      localStorage.setItem(key, JSON.stringify(updated));
+      scheduleSyncToServer();
+    } catch {}
+    return;
+  }
   await rpc("sync_delete_library_items", {
     p_profile_id: profileIndex,
     p_keys: [{ content_id: contentId, content_type: contentType }],
@@ -823,6 +1281,48 @@ export async function pushProgress(
   const duration = Math.max(0, Math.round(durationMs));
   const completed = isComplete(position, duration, ended);
   if (!completed && position < PROGRESS_STORE_THRESHOLD_MS) return false;
+
+  if (isLocalOrCfUser()) {
+    const key = userStorageKey(`progress-${profileIndex}`);
+    const rows = await loadProgress(profileIndex);
+    const progressKey = resolveProgressKey(progressRows, identity);
+    const existingIndex = rows.findIndex(
+      (r) =>
+        r.contentId === identity.contentId &&
+        r.season === identity.season &&
+        r.episode === identity.episode,
+    );
+
+    const newRow: ProgressRow = {
+      contentId: identity.contentId,
+      contentType: identity.contentType,
+      videoId: identity.videoId,
+      season: identity.season,
+      episode: identity.episode,
+      positionMs: completed && duration > 0 ? duration : position,
+      durationMs: duration,
+      lastWatched: Date.now(),
+      progressKey,
+    };
+
+    let updatedRows: ProgressRow[];
+    if (completed) {
+      updatedRows = rows.filter((_, idx) => idx !== existingIndex);
+      void setWatched(profileIndex, identity, identity.contentId, true, progressRows);
+    } else if (existingIndex >= 0) {
+      updatedRows = [...rows];
+      updatedRows[existingIndex] = newRow;
+    } else {
+      updatedRows = [newRow, ...rows];
+    }
+
+    try {
+      localStorage.setItem(key, JSON.stringify(updatedRows));
+      scheduleSyncToServer();
+    } catch {}
+    return true;
+  }
+
   await rpc("sync_push_watch_progress", {
     p_profile_id: profileIndex,
     p_entries: [
@@ -857,6 +1357,14 @@ export function currentSession(): Session | null {
 export async function loadCollections(
   profileIndex: number,
 ): Promise<Collection[]> {
+  if (isLocalOrCfUser()) {
+    try {
+      const saved = localStorage.getItem(userStorageKey(`collections-${profileIndex}`));
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  }
   const rows = await rpc<Array<Record<string, unknown>>>(
     "sync_pull_collections",
     { p_profile_id: profileIndex },
@@ -1007,6 +1515,13 @@ function preferenceKey(item: Record<string, unknown>): string {
 export async function loadHomeLayout(
   profileIndex: number,
 ): Promise<HomeLayout | null> {
+  if (isLocalOrCfUser()) {
+    try {
+      const saved = localStorage.getItem(userStorageKey(`homelayout-${profileIndex}`));
+      if (saved) return JSON.parse(saved);
+    } catch {}
+    return null;
+  }
   for (const platform of HOME_LAYOUT_PLATFORMS) {
     let rows: Array<Record<string, unknown>>;
     try {
@@ -1064,6 +1579,7 @@ export async function loadHomeLayout(
 
 /** Plugin repositories use the same authoritative ordered-list model as Nuvio. */
 export async function loadPlugins(profileIndex: number): Promise<PluginRow[]> {
+  if (isLocalOrCfUser()) return [];
   const query = new URLSearchParams({
     profile_id: `eq.${profileIndex}`,
     select: "url,name,enabled,sort_order",
@@ -1084,6 +1600,7 @@ export async function savePlugins(
   profileIndex: number,
   plugins: PluginRow[],
 ): Promise<void> {
+  if (isLocalOrCfUser()) return;
   await rpc("sync_push_plugins", {
     p_profile_id: profileIndex,
     p_plugins: plugins.map((plugin, index) => ({
@@ -1107,6 +1624,13 @@ export async function pushHomeLayout(
   profileIndex: number,
   next: HomeLayout,
 ): Promise<HomeLayout> {
+  if (isLocalOrCfUser()) {
+    try {
+      localStorage.setItem(userStorageKey(`homelayout-${profileIndex}`), JSON.stringify(next));
+      scheduleSyncToServer();
+    } catch {}
+    return next;
+  }
   const rows = await rpc<Array<Record<string, unknown>>>(
     "sync_pull_home_catalog_settings",
     { p_profile_id: profileIndex, p_platform: "home_catalog_shared" },
@@ -1206,9 +1730,13 @@ async function drainDelta(
 }
 
 export const progressDeltaCursor = (profileIndex: number) =>
-  deltaCursor("sync_get_watch_progress_delta_cursor", profileIndex);
+  isLocalOrCfUser()
+    ? Promise.resolve(0)
+    : deltaCursor("sync_get_watch_progress_delta_cursor", profileIndex);
 export const watchedDeltaCursor = (profileIndex: number) =>
-  deltaCursor("sync_get_watched_items_delta_cursor", profileIndex);
+  isLocalOrCfUser()
+    ? Promise.resolve(0)
+    : deltaCursor("sync_get_watched_items_delta_cursor", profileIndex);
 
 /** Applies progress events onto a snapshot, keyed the way the server keys them. */
 export async function pullProgressDelta(
@@ -1216,6 +1744,7 @@ export async function pullProgressDelta(
   since: number,
   rows: ProgressRow[],
 ): Promise<{ rows: ProgressRow[]; cursor: number }> {
+  if (isLocalOrCfUser()) return { rows, cursor: since };
   const byKey = new Map(rows.map((row) => [row.progressKey ?? "", row]));
   const cursor = await drainDelta(
     "sync_pull_watch_progress_delta",
@@ -1250,6 +1779,7 @@ export async function pullWatchedDelta(
   since: number,
   items: WatchedItem[],
 ): Promise<{ items: WatchedItem[]; cursor: number }> {
+  if (isLocalOrCfUser()) return { items, cursor: since };
   const key = (item: { contentId: string; season?: number; episode?: number }) =>
     `${item.contentId}:${item.season ?? ""}:${item.episode ?? ""}`;
   const byKey = new Map(items.map((item) => [key(item), item]));

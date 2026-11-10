@@ -22,6 +22,12 @@ type WorkerCommand =
   | { id: number; type: "restore" }
   | {
       id: number;
+      type: "setSessionTokens";
+      backend: BackendConfig;
+      tokens: TokenPayload;
+    }
+  | {
+      id: number;
       type: "request";
       path: string;
       init: { method?: string; body?: string; headers?: Record<string, string> };
@@ -352,6 +358,20 @@ async function handle(command: WorkerCommand): Promise<unknown> {
         clearMemorySession();
         throw error;
       }
+    });
+  }
+  if (command.type === "setSessionTokens") {
+    return withAuthLock(async () => {
+      await clearSession();
+      invalidateOtherVaults();
+      const targetBackend = assertBackend(command.backend);
+      backend = targetBackend;
+      const setGen = generation;
+      if (!command.tokens.user?.id)
+        throw new Error("The session tokens did not include a valid user.");
+      user = command.tokens.user;
+      await acceptTokens(command.tokens, setGen, targetBackend);
+      return { user, backend: targetBackend };
     });
   }
   if (command.type === "signOut") {

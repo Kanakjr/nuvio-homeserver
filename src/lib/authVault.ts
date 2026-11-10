@@ -17,6 +17,7 @@ import type { BackendConfig, Session } from "../types";
 
 type VaultCommand =
   | { type: "signIn"; backend: BackendConfig; email: string; password: string }
+  | { type: "setSessionTokens"; backend: BackendConfig; tokens: Record<string, unknown> }
   | { type: "signOut" }
   | { type: "restore" }
   | {
@@ -89,6 +90,8 @@ export const authVault: AuthApi = {
   signIn: (backend, email, password) =>
     vaultCall<Session>({ type: "signIn", backend, email, password }),
   restore: () => vaultCall<Session>({ type: "restore" }),
+  setSessionTokens: (backend, tokens) =>
+    vaultCall<Session>({ type: "setSessionTokens", backend, tokens }),
   signOut: () => vaultCall<void>({ type: "signOut" }),
   request: <T>(
     path: string,

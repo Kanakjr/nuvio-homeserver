@@ -1,5 +1,6 @@
 import { Check, Lock, LogOut, Users } from "lucide-react";
 import { useState } from "react";
+import { currentSession } from "../lib/account";
 import type { Profile } from "../types";
 
 function Avatar({ profile }: { profile?: Profile }) {
@@ -54,6 +55,21 @@ export function ProfileSwitcher({
             <header>
               <span className="eyebrow">WHO'S WATCHING?</span>
               <strong>{active?.name}</strong>
+              {currentSession()?.user?.email && (
+                <span
+                  style={{
+                    display: "block",
+                    fontSize: "0.75rem",
+                    color: "rgba(255, 255, 255, 0.55)",
+                    marginTop: "2px",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {currentSession()?.user?.email}
+                </span>
+              )}
             </header>
             <div className="profile-icon-grid">
               {profiles.map((profile) => (

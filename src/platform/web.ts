@@ -23,10 +23,75 @@ import { authVault } from "../lib/authVault.ts";
 import { saveToDevice } from "../lib/fileDownload.ts";
 import { deleteValue, getValue, setValue } from "../lib/idb.ts";
 import { webRequest } from "../lib/webRequest.ts";
-import type { Platform } from "./types.ts";
+import type { DownloadsApi, DownloadsSnapshot, DownloadRequest, Platform } from "./types.ts";
+
+export const homeServerDownloads: DownloadsApi = {
+  async list(): Promise<DownloadsSnapshot> {
+    try {
+      const res = await fetch("/api/cache/list");
+      if (!res.ok) {
+        return { root: "HomeServer SSD", items: [] };
+      }
+      const data = await res.json();
+      return {
+        root: data.root || "HomeServer SSD (/root/.stremio-server/stremio-cache)",
+        items: data.items || [],
+      };
+    } catch {
+      return { root: "HomeServer SSD", items: [] };
+    }
+  },
+
+  async enqueue(request: DownloadRequest): Promise<void> {
+    await fetch("/api/cache/enqueue", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(request),
+    });
+  },
+
+  async cancel(id: string): Promise<void> {
+    await fetch("/api/cache/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    });
+  },
+
+  async retry(id: string): Promise<void> {
+    await fetch("/api/cache/retry", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    });
+  },
+
+  async remove(id: string): Promise<void> {
+    await fetch("/api/cache/remove", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    });
+  },
+
+  async artwork(): Promise<string | null> {
+    return null;
+  },
+
+  async openFolder(): Promise<void> {
+    alert("HomeServer SSD Cache location:\n/root/.stremio-server/stremio-cache\n\nDirect high-speed torrent cache on HomeServer.");
+  },
+
+  async chooseFolder(): Promise<string | null> {
+    return null;
+  },
+
+  async moveStorage(): Promise<void> {},
+};
 
 export const webPlatform: Platform = {
   auth: authVault,
+  downloads: homeServerDownloads,
   fileSave: { save: saveToDevice },
   externalPlayer: {
     options: externalPlayerOptions,
