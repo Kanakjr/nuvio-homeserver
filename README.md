@@ -46,15 +46,19 @@ graph TD
 - **Real-Time Progress**: Tracks addon resolution and queue progress in the background while you continue browsing or watching.
 
 ### 5. 📥 Embedded Library Download Manager & Swarm Telemetry
-- **Dedicated Downloads Tab**: Seamlessly integrated into Library (`/library?tab=downloads`).
+- **Dedicated Downloads Tab**: Seamlessly integrated into Library (`/library?tab=downloads`) and dedicated sidebar navigation.
 - **Live Swarm Telemetry**: Real-time display of download speeds (MB/s), downloaded percentage, total size, connected peers, and swarm health.
 - **Direct Instant Playback**: Stream directly from the local server SSD without buffer stalls while the download progresses.
 - **Navigation Badge**: Unread/active download count pill rendered on the desktop navigation rail and mobile bar.
+
+![Downloads Manager](docs/screenshots/downloads-manager.png)
 
 ### 6. 🔐 Zero-Trust SSO & Multi-Profile Management
 - **Cloudflare Access Auto-Login**: Automatically authenticates users via `Cf-Access-Authenticated-User-Email` headers.
 - **Self-Hosted Supabase Sync**: Direct profile switching, watch progress, and addon syncing without vendor lock-in.
 - **Guest Mode Fallback**: Instant, zero-config browsing with a full suite of pre-configured community catalogs.
+
+![Home & Profile Management](docs/screenshots/home-and-profiles.png)
 
 ---
 
